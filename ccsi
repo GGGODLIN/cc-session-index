@@ -35,47 +35,44 @@ def connect():
 
 def extract_rows(path):
   rows = []
-  try:
-    with open(path, "r", errors="ignore") as f:
-      for line in f:
-        try:
-          obj = json.loads(line)
-        except json.JSONDecodeError:
-          continue
-        msg = obj.get("message")
-        if not isinstance(msg, dict):
-          continue
-        role = msg.get("role", "")
-        ts = obj.get("timestamp", "")
-        content = msg.get("content")
-        parts = []
-        if isinstance(content, str):
-          parts.append(content)
-        elif isinstance(content, list):
-          for block in content:
-            if not isinstance(block, dict):
-              continue
-            btype = block.get("type")
-            if btype == "text":
-              parts.append(block.get("text", ""))
-            elif btype == "tool_use":
-              name = block.get("name", "")
-              inp = block.get("input") or {}
-              cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
-              if name or cmd:
-                parts.append(f"[{name}] {cmd}"[:2000])
-        text = "\n".join(p for p in parts if p).strip()
-        if text:
-          rows.append((text[:8000], path, ts, role))
-  except OSError:
-    pass
+  with open(path, "r", errors="ignore") as f:
+    for line in f:
+      try:
+        obj = json.loads(line)
+      except json.JSONDecodeError:
+        continue
+      msg = obj.get("message")
+      if not isinstance(msg, dict):
+        continue
+      role = msg.get("role", "")
+      ts = obj.get("timestamp", "")
+      content = msg.get("content")
+      parts = []
+      if isinstance(content, str):
+        parts.append(content)
+      elif isinstance(content, list):
+        for block in content:
+          if not isinstance(block, dict):
+            continue
+          btype = block.get("type")
+          if btype == "text":
+            parts.append(block.get("text", ""))
+          elif btype == "tool_use":
+            name = block.get("name", "")
+            inp = block.get("input") or {}
+            cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
+            if name or cmd:
+              parts.append(f"[{name}] {cmd}"[:2000])
+      text = "\n".join(p for p in parts if p).strip()
+      if text:
+        rows.append((text[:8000], path, ts, role))
   return rows
 
 
 def cmd_index(args):
   db = connect()
   known = dict(db.execute("SELECT path, mtime FROM files"))
-  scanned = updated = 0
+  scanned = updated = failed = 0
   t0 = time.time()
   for dirpath, _, names in os.walk(ROOT):
     for n in names:
@@ -89,10 +86,16 @@ def cmd_index(args):
       scanned += 1
       if known.get(p) == st.st_mtime:
         continue
+      try:
+        rows = extract_rows(p)
+      except OSError as e:
+        failed += 1
+        print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
+        continue
       db.execute("DELETE FROM messages WHERE path = ?", (p,))
       db.executemany(
         "INSERT INTO messages (text, path, ts, role) VALUES (?, ?, ?, ?)",
-        extract_rows(p),
+        rows,
       )
       db.execute(
         "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
@@ -103,7 +106,7 @@ def cmd_index(args):
         db.commit()
   db.commit()
   total = db.execute("SELECT count(*) FROM messages").fetchone()[0]
-  print(f"scanned={scanned} updated={updated} rows={total} took={time.time()-t0:.1f}s")
+  print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
 
 def cmd_search(args):
