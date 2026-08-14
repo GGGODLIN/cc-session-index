@@ -5,14 +5,16 @@ SQLite FTS5 全文索引 over Claude Code session jsonl（`~/.claude/projects/**
 ## 用法
 
 ```sh
-./ccsi index            # 建立或增量更新索引（比對 mtime，只重讀變過的檔）
-./ccsi search "查詢字串" -k 10
+ccsi index            # 建立或增量更新索引（比對 mtime，只重讀變過的檔）
+ccsi search "查詢字串" -k 10
 ```
 
 - 索引落點：`~/Library/Caches/cc-session-index/index.sqlite`
 - 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令字串），單則截 8000 字
 - tokenizer：FTS5 trigram——中文子字串直接可搜，query 給 3 字以上
-- 首次全量建索引慢（萬檔級、trigram 斷詞成本高）；之後增量只付變動檔
+- 首次全量建索引慢（本機 33,744 檔耗時 43 分鐘）；之後增量目前約 20 秒
+- `~/.local/bin/ccsi` 已連到本專案腳本
+- LaunchAgent `com.gggodlin.cc-session-index` 每 6 小時低優先度增量更新，log 在同一 cache 目錄
 
 ## 已知限制
 
