@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+
+ROOT = os.path.expanduser("~/.claude/projects")
+DB_DIR = os.path.expanduser("~/Library/Caches/cc-session-index")
+DB_PATH = os.path.join(DB_DIR, "index.sqlite")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (
+  path TEXT PRIMARY KEY,
+  mtime REAL NOT NULL,
+  size INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
+  text,
+  path UNINDEXED,
+  ts UNINDEXED,
+  role UNINDEXED,
+  tokenize='trigram'
+);
+"""
+
+
+def connect():
+  os.makedirs(DB_DIR, exist_ok=True)
+  db = sqlite3.connect(DB_PATH)
+  db.executescript(SCHEMA)
+  return db
+
+
+def extract_rows(path):
+  rows = []
+  try:
+    with open(path, "r", errors="ignore") as f:
+      for line in f:
+        try:
+          obj = json.loads(line)
+        except json.JSONDecodeError:
+          continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+          continue
+        role = msg.get("role", "")
+        ts = obj.get("timestamp", "")
+        content = msg.get("content")
+        parts = []
+        if isinstance(content, str):
+          parts.append(content)
+        elif isinstance(content, list):
+          for block in content:
+            if not isinstance(block, dict):
+              continue
+            btype = block.get("type")
+            if btype == "text":
+              parts.append(block.get("text", ""))
+            elif btype == "tool_use":
+              name = block.get("name", "")
+              inp = block.get("input") or {}
+              cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
+              if name or cmd:
+                parts.append(f"[{name}] {cmd}"[:2000])
+        text = "\n".join(p for p in parts if p).strip()
+        if text:
+          rows.append((text[:8000], path, ts, role))
+  except OSError:
+    pass
+  return rows
+
+
+def cmd_index(args):
+  db = connect()
+  known = dict(db.execute("SELECT path, mtime FROM files"))
+  scanned = updated = 0
+  t0 = time.time()
+  for dirpath, _, names in os.walk(ROOT):
+    for n in names:
+      if not n.endswith(".jsonl"):
+        continue
+      p = os.path.join(dirpath, n)
+      try:
+        st = os.stat(p)
+      except OSError:
+        continue
+      scanned += 1
+      if known.get(p) == st.st_mtime:
+        continue
+      db.execute("DELETE FROM messages WHERE path = ?", (p,))
+      db.executemany(
+        "INSERT INTO messages (text, path, ts, role) VALUES (?, ?, ?, ?)",
+        extract_rows(p),
+      )
+      db.execute(
+        "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
+        (p, st.st_mtime, st.st_size),
+      )
+      updated += 1
+      if updated % 500 == 0:
+        db.commit()
+  db.commit()
+  total = db.execute("SELECT count(*) FROM messages").fetchone()[0]
+  print(f"scanned={scanned} updated={updated} rows={total} took={time.time()-t0:.1f}s")
+
+
+def cmd_search(args):
+  db = connect()
+  query = " ".join(args.query)
+  sql = (
+    "SELECT path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 24) "
+    "FROM messages WHERE messages MATCH ? ORDER BY rank LIMIT ?"
+  )
+  try:
+    hits = db.execute(sql, (query, args.k)).fetchall()
+  except sqlite3.OperationalError as e:
+    print(f"query error: {e}", file=sys.stderr)
+    sys.exit(1)
+  for path, ts, role, snip in hits:
+    rel = os.path.relpath(path, ROOT)
+    print(f"--- {rel}  {ts}  [{role}]")
+    print(snip.replace("\n", " ")[:500])
+  if not hits:
+    print("(no hits)")
+
+
+def main():
+  ap = argparse.ArgumentParser(prog="ccsi", description="FTS index over Claude Code session jsonl")
+  sub = ap.add_subparsers(dest="cmd", required=True)
+  p_index = sub.add_parser("index", help="build or incrementally update the index")
+  p_index.set_defaults(fn=cmd_index)
+  p_search = sub.add_parser("search", help="full-text search indexed messages")
+  p_search.add_argument("query", nargs="+")
+  p_search.add_argument("-k", type=int, default=10)
+  p_search.set_defaults(fn=cmd_search)
+  args = ap.parse_args()
+  args.fn(args)
+
+
+if __name__ == "__main__":
+  main()
