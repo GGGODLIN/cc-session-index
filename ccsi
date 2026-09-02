@@ -92,7 +92,8 @@ def cmd_index(args):
         failed += 1
         print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
         continue
-      db.execute("DELETE FROM messages WHERE path = ?", (p,))
+      if p in known:
+        db.execute("DELETE FROM messages WHERE path = ?", (p,))
       db.executemany(
         "INSERT INTO messages (text, path, ts, role) VALUES (?, ?, ?, ?)",
         rows,
