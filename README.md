@@ -12,7 +12,7 @@ ccsi search "查詢字串" -k 10
 - 索引落點：`~/Library/Caches/cc-session-index/index.sqlite`
 - 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令字串），單則截 8000 字
 - tokenizer：FTS5 trigram——中文子字串直接可搜，query 給 3 字以上
-- 首次全量建索引慢（本機 33,744 檔耗時 43 分鐘）；之後增量目前約 20 秒
+- 首次全量建索引會跳過不存在舊資料的新檔刪除；15,000 檔回歸測試由 14.4 秒降至 2.7 秒。2026-09-02 實測完整重建 39,465 檔耗時 184.3 秒，後續 7 檔增量耗時 8.7 秒
 - `~/.local/bin/ccsi` 已連到本專案腳本
 - LaunchAgent `com.gggodlin.cc-session-index` 每 6 小時低優先度增量更新，log 在同一 cache 目錄
 
@@ -21,3 +21,4 @@ ccsi search "查詢字串" -k 10
 - FTS5 MATCH 語法字元（`"` `*` `-` 等）會被當運算子，字面搜尋請加雙引號包裹
 - 不索引 tool result 內文（只索引指令與對話文字），要挖 tool 輸出仍回 grep
 - jsonl 被 CC 清掉後索引殘留舊列，`index` 不做刪除偵測（重建：刪 sqlite 重跑）
+- 大量既有檔案同時改變 mtime 時，增量更新仍會逐檔掃描 FTS 舊列；這種搬機情境應備份並移除 cache 後做乾淨重建
