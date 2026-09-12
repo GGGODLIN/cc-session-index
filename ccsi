@@ -6,7 +6,12 @@ import sqlite3
 import sys
 import time
 
-ROOT = os.path.expanduser("~/.claude/projects")
+ROOTS = (
+  ("cc", os.path.expanduser("~/.claude/projects")),
+  ("codex", os.path.expanduser("~/.codex/sessions")),
+  ("codex", os.path.expanduser("~/.codex/archived_sessions")),
+)
+ROOT = ROOTS[0][1]
 DB_DIR = os.path.expanduser("~/Library/Caches/cc-session-index")
 DB_PATH = os.path.join(DB_DIR, "index.sqlite")
 
@@ -33,39 +38,152 @@ def connect():
   return db
 
 
-def extract_rows(path):
-  rows = []
+def vendor_of(path):
+  for vendor, root in ROOTS:
+    if path.startswith(root + os.sep):
+      return vendor, root
+  return "cc", ROOT
+
+
+def iter_files(vendors):
+  for vendor, root in ROOTS:
+    if vendor not in vendors or not os.path.isdir(root):
+      continue
+    for dirpath, _, names in os.walk(root):
+      for n in names:
+        if n.endswith(".jsonl"):
+          yield vendor, os.path.join(dirpath, n)
+
+
+def load_lines(path):
   with open(path, "r", errors="ignore") as f:
     for line in f:
       try:
-        obj = json.loads(line)
+        yield json.loads(line)
       except json.JSONDecodeError:
         continue
-      msg = obj.get("message")
-      if not isinstance(msg, dict):
+
+
+def cc_blocks(content):
+  if isinstance(content, str):
+    yield ("text", content, None)
+    return
+  if not isinstance(content, list):
+    return
+  for block in content:
+    if not isinstance(block, dict):
+      continue
+    btype = block.get("type")
+    if btype == "text":
+      yield ("text", block.get("text", ""), None)
+    elif btype == "tool_use":
+      inp = block.get("input") or {}
+      cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
+      yield ("tool_call", cmd, {"tool": block.get("name", ""), "input": inp})
+    elif btype == "tool_result":
+      c = block.get("content")
+      text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
+      yield ("tool_result", text, None)
+
+
+def codex_text(content):
+  if isinstance(content, str):
+    return content
+  if isinstance(content, list):
+    return "\n".join(x.get("text", "") for x in content if isinstance(x, dict) and x.get("type") in ("input_text", "output_text", "text"))
+  return ""
+
+
+def events_cc(path):
+  session = os.path.splitext(os.path.basename(path))[0]
+  for obj in load_lines(path):
+    if obj.get("type") not in (None, "user", "assistant"):
+      continue
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+      continue
+    base = {"vendor": "cc", "session": obj.get("sessionId") or session, "path": path, "ts": obj.get("timestamp", ""), "cwd": obj.get("cwd", ""), "role": msg.get("role", obj.get("type")), "model": msg.get("model", "")}
+    for kind, text, extra in cc_blocks(msg.get("content")):
+      if kind == "text" and (obj.get("isMeta") or not text.strip()):
         continue
-      role = msg.get("role", "")
-      ts = obj.get("timestamp", "")
-      content = msg.get("content")
-      parts = []
-      if isinstance(content, str):
-        parts.append(content)
-      elif isinstance(content, list):
-        for block in content:
-          if not isinstance(block, dict):
-            continue
-          btype = block.get("type")
-          if btype == "text":
-            parts.append(block.get("text", ""))
-          elif btype == "tool_use":
-            name = block.get("name", "")
-            inp = block.get("input") or {}
-            cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
-            if name or cmd:
-              parts.append(f"[{name}] {cmd}"[:2000])
-      text = "\n".join(p for p in parts if p).strip()
-      if text:
-        rows.append((text[:8000], path, ts, role))
+      ev = dict(base, kind=kind, text=text[:8000])
+      if extra:
+        ev["tool"] = extra["tool"]
+        if extra["tool"] == "Agent":
+          ev["agent_type"] = extra["input"].get("subagent_type", "")
+          ev["agent_model"] = extra["input"].get("model", "")
+        if extra["tool"] == "Skill":
+          ev["skill"] = extra["input"].get("skill", "")
+      yield ev
+
+
+def events_codex(path):
+  session = os.path.splitext(os.path.basename(path))[0]
+  cwd = ""
+  model = ""
+  effort = ""
+  role_tag = ""
+  for obj in load_lines(path):
+    t = obj.get("type")
+    p = obj.get("payload") or {}
+    ts = obj.get("timestamp", "")
+    if t == "session_meta":
+      session = p.get("id") or session
+      cwd = p.get("cwd", "") or cwd
+      sub = ((p.get("source") or {}).get("subagent") or {}) if isinstance(p.get("source"), dict) else {}
+      spawn = sub.get("thread_spawn") if isinstance(sub, dict) else None
+      role_tag = (spawn or {}).get("agent_role", "") if isinstance(spawn, dict) else (sub.get("other", "") if isinstance(sub, dict) else "")
+      yield {"vendor": "codex", "session": session, "path": path, "ts": ts, "cwd": cwd, "role": "meta", "kind": "session_meta", "text": "", "model": "", "agent_role": role_tag, "originator": p.get("originator", "")}
+      continue
+    if t == "turn_context":
+      model = p.get("model", "") or model
+      effort = p.get("effort", "") or effort
+      cwd = p.get("cwd", "") or cwd
+      yield {"vendor": "codex", "session": session, "path": path, "ts": ts, "cwd": cwd, "role": "meta", "kind": "turn_context", "text": "", "model": model, "effort": effort, "agent_role": role_tag}
+      continue
+    if t != "response_item":
+      continue
+    base = {"vendor": "codex", "session": session, "path": path, "ts": ts, "cwd": cwd, "model": model, "effort": effort, "agent_role": role_tag}
+    pt = p.get("type")
+    if pt == "message":
+      text = codex_text(p.get("content"))
+      if text.strip():
+        yield dict(base, role=p.get("role", ""), kind="text", text=text[:8000])
+    elif pt in ("function_call", "custom_tool_call"):
+      args = p.get("arguments") if pt == "function_call" else p.get("input")
+      parsed = None
+      if isinstance(args, str):
+        try:
+          parsed = json.loads(args)
+        except ValueError:
+          parsed = None
+      text = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+      ev = dict(base, role="assistant", kind="tool_call", tool=p.get("name", ""), text=(text or "")[:8000])
+      if isinstance(parsed, dict) and p.get("name") == "spawn_agent":
+        ev["agent_type"] = parsed.get("agent_type", "")
+      yield ev
+    elif pt in ("function_call_output", "custom_tool_call_output"):
+      out = p.get("output")
+      text = out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+      yield dict(base, role="tool", kind="tool_result", text=(text or "")[:8000])
+
+
+def events_for(vendor, path):
+  return events_cc(path) if vendor == "cc" else events_codex(path)
+
+
+def extract_rows(path, vendor=None):
+  vendor = vendor or vendor_of(path)[0]
+  rows = []
+  for ev in events_for(vendor, path):
+    if ev["kind"] == "text":
+      text = ev["text"].strip()
+    elif ev["kind"] == "tool_call":
+      text = f"[{ev.get('tool', '')}] {ev['text']}"[:2000] if (ev.get("tool") or ev["text"]) else ""
+    else:
+      continue
+    if text:
+      rows.append((text[:8000], path, ev["ts"], ev["role"]))
   return rows
 
 
@@ -74,37 +192,33 @@ def cmd_index(args):
   known = dict(db.execute("SELECT path, mtime FROM files"))
   scanned = updated = failed = 0
   t0 = time.time()
-  for dirpath, _, names in os.walk(ROOT):
-    for n in names:
-      if not n.endswith(".jsonl"):
-        continue
-      p = os.path.join(dirpath, n)
-      try:
-        st = os.stat(p)
-      except OSError:
-        continue
-      scanned += 1
-      if known.get(p) == st.st_mtime:
-        continue
-      try:
-        rows = extract_rows(p)
-      except OSError as e:
-        failed += 1
-        print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
-        continue
-      if p in known:
-        db.execute("DELETE FROM messages WHERE path = ?", (p,))
-      db.executemany(
-        "INSERT INTO messages (text, path, ts, role) VALUES (?, ?, ?, ?)",
-        rows,
-      )
-      db.execute(
-        "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
-        (p, st.st_mtime, st.st_size),
-      )
-      updated += 1
-      if updated % 500 == 0:
-        db.commit()
+  for vendor, p in iter_files(set(args.vendor or ("cc", "codex"))):
+    try:
+      st = os.stat(p)
+    except OSError:
+      continue
+    scanned += 1
+    if known.get(p) == st.st_mtime:
+      continue
+    try:
+      rows = extract_rows(p, vendor)
+    except OSError as e:
+      failed += 1
+      print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
+      continue
+    if p in known:
+      db.execute("DELETE FROM messages WHERE path = ?", (p,))
+    db.executemany(
+      "INSERT INTO messages (text, path, ts, role) VALUES (?, ?, ?, ?)",
+      rows,
+    )
+    db.execute(
+      "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
+      (p, st.st_mtime, st.st_size),
+    )
+    updated += 1
+    if updated % 500 == 0:
+      db.commit()
   db.commit()
   total = db.execute("SELECT count(*) FROM messages").fetchone()[0]
   print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
@@ -115,30 +229,70 @@ def cmd_search(args):
   query = " ".join(args.query)
   sql = (
     "SELECT path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 24) "
-    "FROM messages WHERE messages MATCH ? ORDER BY rank LIMIT ?"
+    "FROM messages WHERE messages MATCH ?"
   )
+  params = [query]
+  if args.vendor:
+    roots = [root for vendor, root in ROOTS if vendor in args.vendor]
+    sql += " AND (" + " OR ".join("path LIKE ?" for _ in roots) + ")"
+    params.extend(root + os.sep + "%" for root in roots)
+  sql += " ORDER BY rank LIMIT ?"
+  params.append(args.k)
   try:
-    hits = db.execute(sql, (query, args.k)).fetchall()
+    hits = db.execute(sql, params).fetchall()
   except sqlite3.OperationalError as e:
     print(f"query error: {e}", file=sys.stderr)
     sys.exit(1)
   for path, ts, role, snip in hits:
-    rel = os.path.relpath(path, ROOT)
-    print(f"--- {rel}  {ts}  [{role}]")
+    vendor, root = vendor_of(path)
+    rel = os.path.relpath(path, root)
+    print(f"--- [{vendor}] {rel}  {ts}  [{role}]")
     print(snip.replace("\n", " ")[:500])
   if not hits:
     print("(no hits)")
 
 
+def cmd_events(args):
+  since = args.since or ""
+  kinds = set(args.kind) if args.kind else None
+  out = sys.stdout
+  for vendor, p in iter_files(set(args.vendor or ("cc", "codex"))):
+    if args.session and args.session not in os.path.basename(p):
+      continue
+    if since:
+      try:
+        if time.strftime("%Y-%m-%d", time.localtime(os.stat(p).st_mtime)) < since:
+          continue
+      except OSError:
+        continue
+    for ev in events_for(vendor, p):
+      if since and ev["ts"] and ev["ts"][:10] < since:
+        continue
+      if kinds and ev["kind"] not in kinds:
+        continue
+      if args.tool and ev.get("tool") != args.tool:
+        continue
+      out.write(json.dumps(ev, ensure_ascii=False) + "\n")
+
+
 def main():
-  ap = argparse.ArgumentParser(prog="ccsi", description="FTS index over Claude Code session jsonl")
+  ap = argparse.ArgumentParser(prog="ccsi", description="FTS index and normalized event stream over CC (~/.claude/projects) and Codex (~/.codex/sessions, archived_sessions) jsonl")
   sub = ap.add_subparsers(dest="cmd", required=True)
   p_index = sub.add_parser("index", help="build or incrementally update the index")
+  p_index.add_argument("--vendor", action="append", choices=("cc", "codex"), help="restrict to one vendor (default both)")
   p_index.set_defaults(fn=cmd_index)
   p_search = sub.add_parser("search", help="full-text search indexed messages")
   p_search.add_argument("query", nargs="+")
   p_search.add_argument("-k", type=int, default=10)
+  p_search.add_argument("--vendor", action="append", choices=("cc", "codex"), help="restrict hits to one vendor")
   p_search.set_defaults(fn=cmd_search)
+  p_events = sub.add_parser("events", help="stream normalized events as JSONL (vendor, session, ts, cwd, role, kind, tool, model, text)")
+  p_events.add_argument("--vendor", action="append", choices=("cc", "codex"))
+  p_events.add_argument("--since", help="YYYY-MM-DD; skip files older than this and events before it")
+  p_events.add_argument("--session", help="substring of the session file name")
+  p_events.add_argument("--kind", action="append", choices=("text", "tool_call", "tool_result", "session_meta", "turn_context"))
+  p_events.add_argument("--tool", help="only tool_call events for this tool name")
+  p_events.set_defaults(fn=cmd_events)
   args = ap.parse_args()
   args.fn(args)
 

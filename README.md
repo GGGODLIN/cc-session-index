@@ -1,13 +1,27 @@
 # cc-session-index
 
-SQLite FTS5 全文索引 over Claude Code session jsonl（`~/.claude/projects/**/*.jsonl`），取代 grep 全量掃。概念借鑑 deepseek-harness 的 session-query-sqlite（2026-08-14 競合分析抽件 #1）。
+SQLite FTS5 全文索引 over Claude Code 與 Codex 的 session jsonl，取代 grep 全量掃。概念借鑑 deepseek-harness 的 session-query-sqlite（2026-08-14 競合分析抽件 #1）。2026-09-13 起雙軌：三個根目錄一起掃，搜尋結果帶 `[cc]`／`[codex]` 標籤，另有 `events` 子命令把兩種格式攤成同一種事件流給治理分析用。
+
+| vendor | 根目錄 | 格式 |
+|---|---|---|
+| cc | `~/.claude/projects/**/*.jsonl` | 一行一則 `type=user/assistant`＋`message` |
+| codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`、`~/.codex/archived_sessions/rollout-*.jsonl` | 一行一則 `session_meta／turn_context／response_item／event_msg`＋`payload` |
 
 ## 用法
 
 ```sh
-ccsi index            # 建立或增量更新索引（比對 mtime，只重讀變過的檔）
+ccsi index                       # 建立或增量更新索引（比對 mtime，只重讀變過的檔；兩個 vendor 都掃）
+ccsi index --vendor codex        # 只掃一邊
 ccsi search "查詢字串" -k 10
+ccsi search "查詢字串" --vendor codex   # 只看 Codex 的命中
+
+ccsi events --vendor codex --since 2026-09-13 --kind tool_call --tool spawn_agent   # 一行一個正規化事件（JSONL）
+ccsi events --session 97ac80ca --kind text
 ```
+
+`events` 每行欄位：`vendor、session、path、ts、cwd、role、kind（text｜tool_call｜tool_result｜session_meta｜turn_context）、text`，加上 `tool`、`model`；CC 的 Agent 呼叫多帶 `agent_type`／`agent_model`、Skill 呼叫帶 `skill`；Codex 多帶 `effort`、子 thread 的 `agent_role`（來自 session_meta.source.subagent）、`spawn_agent` 的 `agent_type`。Codex 子 agent 的真實模型只信 `turn_context`（會跟在同 session 的後續事件 `model` 欄），不信它自報的文字。
+
+治理問題兩端一起問的寫法：先 `ccsi events --since <日期> --kind tool_call` 落成一個 JSONL，再用 jq 依 `vendor` 分組；不要各寫一套解析。
 
 - 索引落點：`~/Library/Caches/cc-session-index/index.sqlite`
 - 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令字串），單則截 8000 字
