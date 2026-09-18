@@ -64,6 +64,17 @@ def load_lines(path):
         continue
 
 
+def as_text(value):
+  if isinstance(value, str):
+    return value
+  if value is None:
+    return ""
+  try:
+    return json.dumps(value, ensure_ascii=False, default=str)
+  except (TypeError, ValueError):
+    return str(value)
+
+
 def cc_blocks(content):
   if isinstance(content, str):
     yield ("text", content, None)
@@ -75,15 +86,15 @@ def cc_blocks(content):
       continue
     btype = block.get("type")
     if btype == "text":
-      yield ("text", block.get("text", ""), None)
+      yield ("text", as_text(block.get("text", "")), None)
     elif btype == "tool_use":
       inp = block.get("input") or {}
       cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
-      yield ("tool_call", cmd, {"tool": block.get("name", ""), "input": inp})
+      yield ("tool_call", as_text(cmd), {"tool": block.get("name", ""), "input": inp})
     elif btype == "tool_result":
       c = block.get("content")
-      text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
-      yield ("tool_result", text, None)
+      text = c if isinstance(c, str) else " ".join(as_text(x.get("text", "")) for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
+      yield ("tool_result", as_text(text), None)
 
 
 def codex_text(content):
