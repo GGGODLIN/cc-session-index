@@ -153,6 +153,38 @@ class DualVendorTest(unittest.TestCase):
       self.assertEqual(run_ccsi(home, "events", "--since", "2027-01-01").stdout, "")
 
 
+class StructuredToolInputTest(unittest.TestCase):
+  def test_object_valued_tool_arguments_are_indexed_without_crashing(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/structured.jsonl"
+      session.parent.mkdir(parents=True)
+      session.write_text(
+        json.dumps({
+          "type": "assistant",
+          "sessionId": "structured",
+          "timestamp": "2026-09-19T00:00:00Z",
+          "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "mcp__mongodb__count", "input": {"query": {"endDate": None, "tag": "objectneedle"}}},
+            {"type": "tool_use", "id": "t2", "name": "Artifact", "input": {"query": {"limit": 5, "cursor": "cursorneedle"}}},
+          ]},
+        }) + "\n"
+        + json.dumps({
+          "type": "assistant",
+          "sessionId": "structured",
+          "timestamp": "2026-09-19T00:00:01Z",
+          "message": {"role": "assistant", "content": [
+            {"type": "text", "text": {"unexpected": "textneedle"}},
+          ]},
+        }) + "\n"
+      )
+
+      run_ccsi(home, "index")
+
+      for needle in ("objectneedle", "cursorneedle", "textneedle"):
+        self.assertIn("structured.jsonl", run_ccsi(home, "search", needle).stdout, needle)
+
+
 class IndexPerformanceTest(unittest.TestCase):
   def test_initial_build_avoids_quadratic_fts_scans(self):
     with tempfile.TemporaryDirectory() as tmp:
