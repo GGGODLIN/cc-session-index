@@ -235,6 +235,10 @@ def cmd_index(args):
   print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
 
+def literal_query(query):
+  return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
+
+
 def cmd_search(args):
   db = connect()
   query = " ".join(args.query)
@@ -251,9 +255,12 @@ def cmd_search(args):
   params.append(args.k)
   try:
     hits = db.execute(sql, params).fetchall()
-  except sqlite3.OperationalError as e:
-    print(f"query error: {e}", file=sys.stderr)
-    sys.exit(1)
+  except sqlite3.OperationalError:
+    try:
+      hits = db.execute(sql, [literal_query(query)] + params[1:]).fetchall()
+    except sqlite3.OperationalError as e:
+      print(f"query error: {e}", file=sys.stderr)
+      sys.exit(1)
   for path, ts, role, snip in hits:
     vendor, root = vendor_of(path)
     rel = os.path.relpath(path, root)

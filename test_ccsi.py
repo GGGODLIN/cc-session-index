@@ -185,6 +185,25 @@ class StructuredToolInputTest(unittest.TestCase):
         self.assertIn("structured.jsonl", run_ccsi(home, "search", needle).stdout, needle)
 
 
+class SearchQueryTest(unittest.TestCase):
+  def test_queries_with_fts_punctuation_match_literally(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/punct.jsonl"
+      session.parent.mkdir(parents=True)
+      session.write_text(json.dumps({
+        "type": "user",
+        "sessionId": "punct",
+        "timestamp": "2026-09-24T00:00:00Z",
+        "message": {"role": "user", "content": "check config.yaml under ~/.cli-proxy-api/logs today"},
+      }) + "\n")
+
+      run_ccsi(home, "index")
+
+      for query in ("config.yaml", "~/.cli-proxy-api/logs", "cli-proxy-api"):
+        self.assertIn("punct.jsonl", run_ccsi(home, "search", query).stdout, query)
+
+
 class IndexPerformanceTest(unittest.TestCase):
   def test_initial_build_avoids_quadratic_fts_scans(self):
     with tempfile.TemporaryDirectory() as tmp:
