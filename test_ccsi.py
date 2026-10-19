@@ -128,6 +128,8 @@ class DualVendorTest(unittest.TestCase):
       self.assertIn("rollout-2026-09-01T00-00-00-01a0bbbb.jsonl", hits)
       self.assertIn("--- [cc] probe/session.jsonl", run_ccsi(home, "search", "ccneedle").stdout)
       self.assertIn("[>>>spawn_agent<<<] {", run_ccsi(home, "search", "spawn_agent").stdout)
+      self.assertIn("--- [codex]", run_ccsi(home, "search", "codexneedle", "--vendor", "codex").stdout)
+      self.assertIn("--- [cc]", run_ccsi(home, "search", "ccneedle", "--vendor", "cc").stdout)
       self.assertEqual(run_ccsi(home, "search", "codexneedle", "--vendor", "cc").stdout.strip(), "(no hits)")
       self.assertEqual(run_ccsi(home, "search", "ccneedle", "--vendor", "codex").stdout.strip(), "(no hits)")
 
@@ -229,6 +231,121 @@ class IndexPerformanceTest(unittest.TestCase):
       self.assertEqual(file_count, 15_000)
       self.assertEqual(message_count, 15_000)
       self.assertLess(elapsed, 10, f"initial index took {elapsed:.1f}s")
+
+
+class ObeliskEnhancementsTest(unittest.TestCase):
+  def test_append_only_cursor_and_half_line_recovery(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/append.jsonl"
+      session.parent.mkdir(parents=True)
+      first = json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:00Z", "message": {"role": "user", "content": "firstlinealpha"}}) + "\n"
+      half = '{"type": "assistant", "timestamp": "2026-10-19T00:00:01Z", "message": {"role": "assistant", "content": "secondline'
+      session.write_text(first + half)
+      run_ccsi(home, "index")
+
+      self.assertIn("firstlinealpha", run_ccsi(home, "search", "firstlinealpha").stdout)
+      self.assertEqual(run_ccsi(home, "search", "secondlinebeta").stdout.strip(), "(no hits)")
+
+      with open(session, "a") as f:
+        f.write('beta"}}\n')
+      t = session.stat().st_mtime + 5
+      os.utime(session, (t, t))
+      run_ccsi(home, "index")
+
+      self.assertIn("firstlinealpha", run_ccsi(home, "search", "firstlinealpha").stdout)
+      self.assertIn("secondlinebeta", run_ccsi(home, "search", "secondlinebeta").stdout)
+      db_path = home / "Library/Caches/cc-session-index/index.sqlite"
+      with closing(sqlite3.connect(db_path)) as db:
+        total = db.execute("SELECT count(*) FROM messages").fetchone()[0]
+      self.assertEqual(total, 2)
+
+  def test_interleaved_context_and_exclude_session(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      s_a = home / ".claude/projects/probe/sess-alpha.jsonl"
+      s_b = home / ".claude/projects/probe/sess-bravo.jsonl"
+      s_a.parent.mkdir(parents=True)
+      s_a.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:01Z", "message": {"role": "user", "content": "alpha step one"}}) + "\n"
+        + json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:02Z", "message": {"role": "assistant", "content": "alpha step two"}}) + "\n"
+      )
+      s_b.write_text(
+        "".join(
+          json.dumps({"type": "user", "timestamp": f"2026-10-19T00:01:{i:02d}Z", "message": {"role": "user", "content": f"bravo filler {i} sharedkeyword"}}) + "\n"
+          for i in range(10)
+        )
+      )
+      run_ccsi(home, "index")
+
+      with open(s_a, "a") as f:
+        f.write(json.dumps({"type": "user", "timestamp": "2026-10-19T00:02:00Z", "message": {"role": "user", "content": "alpha targetneedle sharedkeyword"}}) + "\n")
+        f.write(json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:02:01Z", "message": {"role": "assistant", "content": "alpha step four"}}) + "\n")
+      t = s_a.stat().st_mtime + 5
+      os.utime(s_a, (t, t))
+      run_ccsi(home, "index")
+
+      ctx_out = run_ccsi(home, "search", "targetneedle", "-C", "2").stdout
+      self.assertIn("alpha step one", ctx_out)
+      self.assertIn("alpha step two", ctx_out)
+      self.assertIn("alpha step four", ctx_out)
+      self.assertNotIn("bravo filler", ctx_out)
+
+      excl_out = run_ccsi(home, "search", "sharedkeyword", "--exclude-session", "sess-bravo").stdout
+      self.assertIn("sess-alpha.jsonl", excl_out)
+      self.assertNotIn("sess-bravo.jsonl", excl_out)
+
+  def test_tool_summary_and_envelope_normalization(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      s = home / ".claude/projects/probe/tools.jsonl"
+      mirror = home / ".claude/projects/codex/mirrored.jsonl"
+      s.parent.mkdir(parents=True)
+      mirror.parent.mkdir(parents=True)
+      mirror.write_text(json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:00Z", "message": {"role": "user", "content": "mirrorneedle"}}) + "\n")
+      s.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:01Z", "message": {"role": "user", "content": "<command-message>github-repo-research</command-message>\n<command-name>/github-repo-research</command-name>\n<command-args>https://github.com/tommy0103/obelisk</command-args>\nBase directory for this skill: /tmp\n# Huge Skill Body shouldbefiltered"}}) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:02Z", "message": {"role": "user", "content": "Base directory for this skill: /tmp\npure skill dump noiseshouldnotmatch"}}) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:03Z", "message": {"role": "user", "content": "<task-notification><task-id>a1</task-id><summary>Agent finished</summary><result>verdictpassneedle</result></task-notification>"}}) + "\n"
+        + json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:04Z", "message": {"role": "assistant", "content": [
+          {"type": "tool_use", "id": "u1", "name": "Edit", "input": {"file_path": "/Users/test/advisor.md"}},
+          {"type": "tool_use", "id": "u2", "name": "Skill", "input": {"skill": "check-my-stack", "args": "obelisk"}},
+          {"type": "tool_use", "id": "u3", "name": "StructuredOutput", "input": {"verdict": "structuredverdictneedle"}},
+          {"type": "tool_use", "id": "u4", "name": "TaskList", "input": {}},
+        ]}}) + "\n"
+      )
+      run_ccsi(home, "index")
+
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "github-repo-research").stdout)
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "tommy0103/obelisk").stdout)
+      self.assertEqual(run_ccsi(home, "search", "noiseshouldnotmatch").stdout.strip(), "(no hits)")
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "verdictpassneedle").stdout)
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "advisor.md").stdout)
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "check-my-stack").stdout)
+      self.assertIn("tools.jsonl", run_ccsi(home, "search", "structuredverdictneedle").stdout)
+      self.assertEqual(run_ccsi(home, "search", "TaskList").stdout.strip(), "(no hits)")
+      self.assertEqual(run_ccsi(home, "search", "mirrorneedle").stdout.strip(), "(no hits)")
+
+  def test_pi_vendor_indexing_and_events(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      pi_file = home / ".pi/agent/sessions/--tmp--/2026-10-19_pi1.jsonl"
+      pi_file.parent.mkdir(parents=True)
+      pi_file.write_text(
+        json.dumps({"type": "session", "version": 3, "id": "pi-sess-1", "timestamp": "2026-10-19T01:00:00.000Z", "cwd": "/tmp/piwork"}) + "\n"
+        + json.dumps({"type": "model_change", "id": "m1", "timestamp": "2026-10-19T01:00:01.000Z", "provider": "openai", "modelId": "gpt-5.6-luna"}) + "\n"
+        + json.dumps({"type": "message", "id": "m2", "timestamp": "2026-10-19T01:00:02.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "pineedle question"}], "timestamp": 1760000002000}}) + "\n"
+        + json.dumps({"type": "message", "id": "m3", "timestamp": "2026-10-19T01:00:03.000Z", "message": {"role": "assistant", "content": [{"type": "toolCall", "id": "c1", "name": "read", "arguments": {"file_path": "/tmp/pifile.ts"}}], "timestamp": 1760000003000}}) + "\n"
+        + json.dumps({"type": "message", "id": "m4", "timestamp": "2026-10-19T01:00:04.000Z", "message": {"role": "toolResult", "toolName": "read", "content": [{"type": "text", "text": "piresultnotindexed"}], "timestamp": 1760000004000}}) + "\n"
+      )
+      run_ccsi(home, "index")
+
+      self.assertIn("--- [pi]", run_ccsi(home, "search", "pineedle", "--vendor", "pi").stdout)
+      self.assertIn("pifile.ts", run_ccsi(home, "search", "pifile.ts", "--vendor", "pi").stdout)
+      self.assertEqual(run_ccsi(home, "search", "piresultnotindexed").stdout.strip(), "(no hits)")
+      evs = [json.loads(l) for l in run_ccsi(home, "events", "--vendor", "pi", "--since", "2026-10-19").stdout.splitlines()]
+      self.assertEqual([e["kind"] for e in evs], ["session_meta", "text", "tool_call", "tool_result"])
+      self.assertEqual(evs[1]["model"], "openai/gpt-5.6-luna")
 
 
 if __name__ == "__main__":
