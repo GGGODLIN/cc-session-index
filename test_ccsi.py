@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -11,11 +12,21 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("ccsi")
 
 
-def run_ccsi(home, *args, check=True):
+def db_path_for(home):
+  if sys.platform == "darwin":
+    return home / "Library/Caches/cc-session-index/index.sqlite"
+  return home / ".cache/cc-session-index/index.sqlite"
+
+
+def run_ccsi(home, *args, check=True, extra_env=None):
   env = os.environ.copy()
   env["HOME"] = str(home)
+  for k in ("CCSI_DB_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "XDG_CACHE_HOME"):
+    env.pop(k, None)
+  if extra_env:
+    env.update(extra_env)
   return subprocess.run(
-    [str(SCRIPT), *args],
+    [sys.executable, str(SCRIPT), *args],
     env=env,
     capture_output=True,
     text=True,
@@ -35,7 +46,7 @@ class IndexSafetyTest(unittest.TestCase):
       }) + "\n")
       run_ccsi(home, "index")
 
-      db_path = home / "Library/Caches/cc-session-index/index.sqlite"
+      db_path = db_path_for(home)
       with closing(sqlite3.connect(db_path)) as db:
         before_mtime = db.execute(
           "SELECT mtime FROM files WHERE path = ?",
@@ -85,7 +96,7 @@ class IndexSafetyTest(unittest.TestCase):
       os.utime(session, (changed_mtime, changed_mtime))
       run_ccsi(home, "index")
 
-      db_path = home / "Library/Caches/cc-session-index/index.sqlite"
+      db_path = db_path_for(home)
       with closing(sqlite3.connect(db_path)) as db:
         old_count = db.execute(
           "SELECT count(*) FROM messages WHERE messages MATCH 'oldneedle'",
@@ -223,7 +234,7 @@ class IndexPerformanceTest(unittest.TestCase):
       run_ccsi(home, "index")
       elapsed = time.monotonic() - started
 
-      db_path = home / "Library/Caches/cc-session-index/index.sqlite"
+      db_path = db_path_for(home)
       with closing(sqlite3.connect(db_path)) as db:
         file_count = db.execute("SELECT count(*) FROM files").fetchone()[0]
         message_count = db.execute("SELECT count(*) FROM messages").fetchone()[0]
@@ -255,7 +266,7 @@ class ObeliskEnhancementsTest(unittest.TestCase):
 
       self.assertIn("firstlinealpha", run_ccsi(home, "search", "firstlinealpha").stdout)
       self.assertIn("secondlinebeta", run_ccsi(home, "search", "secondlinebeta").stdout)
-      db_path = home / "Library/Caches/cc-session-index/index.sqlite"
+      db_path = db_path_for(home)
       with closing(sqlite3.connect(db_path)) as db:
         total = db.execute("SELECT count(*) FROM messages").fetchone()[0]
       self.assertEqual(total, 2)
@@ -363,10 +374,16 @@ class ObeliskEnhancementsTest(unittest.TestCase):
 
       pure_short = run_ccsi(home, "search", "白話", check=False)
       self.assertEqual(pure_short.returncode, 2)
-      self.assertIn("trigram index requires at least one >=3-char token", pure_short.stderr)
+      self.assertIn("trigram index requires >=3-char terms", pure_short.stderr)
 
       two_shorts = run_ccsi(home, "search", "測試", "假綠", check=False)
       self.assertEqual(two_shorts.returncode, 2)
+
+      bool_short = run_ccsi(home, "search", "Herdr AND 狀態", check=False)
+      self.assertEqual(bool_short.returncode, 2)
+
+      quoted_short = run_ccsi(home, "search", 'Herdr "狀態"', check=False)
+      self.assertEqual(quoted_short.returncode, 2)
 
       quoted_phrase = run_ccsi(home, "search", '"測試 假綠"')
       self.assertIn("short-and-ctx.jsonl", quoted_phrase.stdout)
@@ -383,8 +400,31 @@ class ObeliskEnhancementsTest(unittest.TestCase):
       or_query = run_ccsi(home, "search", "左下角 OR betaneedle")
       self.assertEqual(or_query.stdout.count("--- [cc]"), 3)
 
+      punct_or = run_ccsi(home, "search", "100% OR betaneedle")
+      self.assertEqual(punct_or.stdout.count("--- [cc]"), 2)
+
       ctx_out = run_ccsi(home, "search", "Herdr 左下角 狀態", "-C", "1").stdout
       self.assertIn(long_tail, ctx_out)
+
+      db_path = db_path_for(home)
+      self.assertEqual(db_path.stat().st_mode & 0o777, 0o600)
+      self.assertEqual(db_path.parent.stat().st_mode & 0o777, 0o700)
+
+  def test_custom_env_vars_override_roots_and_db_dir(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      custom_cc = home / "custom-claude"
+      custom_db = home / "custom-cache/ccsi-db"
+      s = custom_cc / "projects/probe/envtest.jsonl"
+      s.parent.mkdir(parents=True)
+      s.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-10-19T03:00:00Z", "message": {"role": "user", "content": "customenvneedle"}}) + "\n"
+      )
+      extra = {"CLAUDE_CONFIG_DIR": str(custom_cc), "CCSI_DB_DIR": str(custom_db)}
+      run_ccsi(home, "index", extra_env=extra)
+      self.assertTrue((custom_db / "index.sqlite").exists())
+      out = run_ccsi(home, "search", "customenvneedle", extra_env=extra).stdout
+      self.assertIn("envtest.jsonl", out)
 
 
 if __name__ == "__main__":

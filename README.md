@@ -1,41 +1,115 @@
-# cc-session-index
+# cc-session-index (`ccsi`)
 
-SQLite FTS5 全文索引 over Claude Code、Codex 與 Pi 的 session jsonl，取代 grep 全量掃。概念借鑑 deepseek-harness 的 session-query-sqlite（2026-08-14 競合分析抽件 #1）。2026-09-13 起支援 Codex，2026-10-19 借鑑 Obelisk 補上 Pi 支援、工具檔案參數抽取、控制面雜訊過濾、append-only 位元組游標、`message_refs` 定位表與前後文展開。
+English | [繁體中文](/README.zh-TW.md)
 
-| vendor | 根目錄 | 格式 |
+Single-file, zero-dependency SQLite FTS5 (`tokenize='trigram'`) full-text index and normalized event stream over local coding-agent session transcripts (**Claude Code**, **Codex**, and **Pi**).
+
+Instead of running slow `grep -r` scans across tens of gigabytes of `.jsonl` session logs—or adopting heavy vector/Electron stacks whose default tokenizers fail on CJK (Chinese/Japanese/Korean) substrings—`ccsi` gives your coding agent sub-second literal and CJK substring search with append-only incremental indexing in ~600 lines of standard-library Python.
+
+## Why `ccsi`
+
+1. **Native CJK & substring search (`trigram`)**: SQLite's default `unicode61` tokenizer cannot search arbitrary CJK substrings, and many embedding-based session memory tools pin English-only models. `ccsi` uses FTS5 `trigram`, so 3+ character CJK phrases, file paths, identifiers, and error strings work out of the box.
+2. **Append-only byte cursor + `message_refs` positioning**: On a production corpus of **44 GB / 53,016 `.jsonl` files / 1.50M indexed rows** (`3.5 GB` SQLite index, measured 2026-10-19), incremental updates take **0.6s–6.0s** by reading only newly appended bytes from `(mtime, size, offset, ino)` and avoiding full-table FTS scans via `message_refs(path, mid)`.
+3. **High-signal tool & envelope extraction**: Indexes `Read`, `Edit`, `Write`, `NotebookEdit` file paths, `Bash` commands, `Grep`/`Glob` patterns, `Skill` invocations, and `Agent`/`SendMessage` prompts while skipping empty tool shells and stripping expanded skill prompt bodies (`Base directory for this skill:`) and `<system-reminder>` noise.
+4. **Unified cross-agent event stream (`ccsi events`)**: Streams normalized JSONL events across Claude Code, Codex, and Pi (`vendor`, `session`, `path`, `ts`, `cwd`, `role`, `kind`, `tool`, `model`, `text`) for cross-agent auditing without writing three separate parsers.
+
+| Vendor | Default Root (override env var) | Transcript Format |
 |---|---|---|
-| cc | `~/.claude/projects/**/*.jsonl`（自動排除 `codex/` 備份鏡像） | 一行一則 `type=user/assistant`＋`message` |
-| codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`、`~/.codex/archived_sessions/rollout-*.jsonl` | 一行一則 `session_meta／turn_context／response_item／event_msg`＋`payload` |
-| pi | `~/.pi/agent/sessions/**/*.jsonl` | 一行一則 `session／model_change／message` |
+| `cc` | `~/.claude/projects/**/*.jsonl` (`$CLAUDE_CONFIG_DIR/projects`) | `type=user/assistant` + `message` |
+| `codex` | `~/.codex/sessions/**/rollout-*.jsonl`, `~/.codex/archived_sessions/rollout-*.jsonl` (`$CODEX_HOME`) | `session_meta` / `turn_context` / `response_item` / `event_msg` + `payload` |
+| `pi` | `~/.pi/agent/sessions/**/*.jsonl` (`$PI_CODING_AGENT_DIR/sessions`) | `session` / `model_change` / `message` |
 
-## 用法
+## Install
+
+Requires Python 3.9+ linked against **SQLite 3.34.0+** with FTS5 `trigram` support (included in macOS Homebrew Python and standard Linux distributions). No `pip install` needed.
 
 ```sh
-ccsi index                       # 建立或增量更新索引（三個 vendor 都掃）
-ccsi index --vendor codex        # 只掃指定 vendor（cc / codex / pi）
-ccsi search "查詢字串" -k 10
-ccsi search "查詢字串" --vendor pi
-ccsi search "查詢字串" -C 2      # 印出命中列同檔案前後各 2 筆已索引紀錄
-ccsi search "查詢字串" --exclude-session 94c245bb
+git clone https://github.com/GGGODLIN/cc-session-index.git
+mkdir -p ~/.local/bin
+ln -s "$PWD/cc-session-index/ccsi" ~/.local/bin/ccsi
+# Ensure ~/.local/bin is in your PATH (e.g. export PATH="$HOME/.local/bin:$PATH")
+ccsi index
+```
 
-ccsi events --vendor codex --since 2026-09-13 --kind tool_call --tool spawn_agent   # 一行一個正規化事件（JSONL）
+### Wire into Claude Code (`~/.claude/CLAUDE.md`)
+
+Installing the CLI alone is not enough—agents rarely remember to call a tool unless a routing rule points them to it (on the author's setup, agent calls went from **15** in August before adding the rule to **2,569** across September–October / 429 root sessions after adding it). Add this line to your `~/.claude/CLAUDE.md` (or `rules/common/code-search.md`):
+
+```markdown
+- **Session history search** (how we solved X before, why an approach was dropped, which session made a decision) → `ccsi search "<query>" -k 5` (add `-C 2` for surrounding same-file messages, `--exclude-session <UUID-prefix>` to skip the current session, `--vendor {cc,codex,pi}` to filter). Uses SQLite FTS5 `trigram` (run `ccsi index` first if recent sessions are not indexed yet): include at least one >=3-char token or quoted phrase (e.g. `ccsi search '"測試 假綠"'`), and split uncertain multi-concept queries into separate searches. For unindexed `tool_result` outputs, use `ccsi events --session <id>`.
+```
+
+## Usage
+
+```sh
+ccsi index                                          # Build or incrementally update index (all vendors)
+ccsi index --vendor codex                           # Index only a specific vendor (cc / codex / pi)
+
+ccsi search "query string" -k 10                    # Full-text search (top 10 hits, 64-trigram snippet)
+ccsi search "Herdr 左下角 狀態" -C 2                 # Show 2 indexed messages before & after hit in the same file
+ccsi search '"測試 假綠"' -k 5                       # Pass literal quotes to FTS5 for a phrase of 2-char CJK words
+ccsi search "advisor.md" --exclude-session 94c245bb # Exclude current session by UUID/path substring
+ccsi search "pineedle" --vendor pi                  # Restrict search to one vendor
+
+ccsi events --vendor codex --since 2026-09-13 --kind tool_call --tool spawn_agent
 ccsi events --session 97ac80ca --kind text
 ```
 
-`events` 每行欄位：`vendor、session、path、ts、cwd、role、kind（text｜tool_call｜tool_result｜session_meta｜turn_context）、text`，加上 `tool`、`model`；CC 的 Agent 呼叫多帶 `agent_type`／`agent_model`、Skill 呼叫帶 `skill`；Codex 多帶 `effort`、子 thread 的 `agent_role`（來自 session_meta.source.subagent）、`spawn_agent` 的 `agent_type`。Codex 子 agent 的真實模型只信 `turn_context`（會跟在同 session 的後續事件 `model` 欄），不信它自報的文字。
+### Storage & Environment Variables
 
-治理問題兩端一起問的寫法：先 `ccsi events --since <日期> --kind tool_call` 落成一個 JSONL，再用 jq 依 `vendor` 分組；不要各寫一套解析。
+- Default index location (created with `0700` directory and `0600` file permissions):
+  - macOS: `~/Library/Caches/cc-session-index/index.sqlite`
+  - Linux / other: `${XDG_CACHE_HOME:-~/.cache}/cc-session-index/index.sqlite` (absolute `XDG_CACHE_HOME` only)
+  - Override: set `CCSI_DB_DIR=/custom/path`
+- Concurrency: `ccsi index` acquires an exclusive `flock` on `<DB_DIR>/index.lock` before loading file metadata.
 
-- 索引落點：`~/Library/Caches/cc-session-index/index.sqlite`
-- 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令與關鍵參數摘要），單則截 8000 字
-- tokenizer：FTS5 trigram——中文子字串直接可搜，至少需包含一個 3 字以上詞或雙引號片語（如 `"測試 假綠"`）；純 `<3` 字詞查詢會回傳 exit 2 提示，普通空白分隔的長短詞混合查詢會對 `<3` 字詞附加 `LIKE` 過濾
-- 首次全量建索引會跳過不存在舊資料的新檔刪除；15,000 檔回歸測試由 14.4 秒降至 2.7 秒。2026-10-19 v2 實測完整重建 52,992 檔耗時 371.5 秒，後續暖快取 7 檔增量耗時 0.6 秒
-- `~/.local/bin/ccsi` 已連到本專案腳本
-- LaunchAgent `com.gggodlin.cc-session-index` 約每 15 分鐘（900 秒）低優先度背景增量更新，log 在同一 cache 目錄（剛發生的對話若尚未入庫可先跑 `ccsi index`）
+### Scheduled Background Refresh (Optional)
 
-## 已知限制
+On macOS (`~/Library/LaunchAgents/local.cc-session-index.plist`), point `ProgramArguments` to your Python 3.9+ binary (e.g. `/opt/homebrew/bin/python3`) and run every 15 minutes (`900` seconds) at background priority:
 
-- FTS5 MATCH 語法字元（`"` `*` `-` 等）會被當運算子，字面搜尋請加雙引號包裹
-- 不索引 tool result 內文（只索引指令與對話文字），要挖 tool 輸出仍回 grep
-- jsonl 被 CC 清掉後索引殘留舊列，`index` 不做刪除偵測（重建：刪 sqlite 重跑）
-- 大量既有檔案同時改變 mtime 時，增量更新仍會逐檔掃描 FTS 舊列；這種搬機情境應備份並移除 cache 後做乾淨重建
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.cc-session-index</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/YOUR_USER/.local/bin/ccsi</string>
+    <string>index</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>10</integer>
+</dict>
+</plist>
+```
+
+On Linux (`crontab -e`):
+
+```cron
+*/15 * * * * ~/.local/bin/ccsi index >> ~/.cache/cc-session-index/cron.log 2>&1
+```
+
+## Known Limits
+
+- **Trigram minimum length (3 chars)**: FTS5 `trigram` requires at least one token or quoted phrase of `>= 3` characters. Queries with only 1–2 character tokens (or boolean/quoted queries containing `< 3`-char operands) exit with code `2` and an explanation rather than silently returning wrong results. In plain space-separated queries that mix `>= 3`-char and `< 3`-char tokens, `ccsi` automatically filters the `< 3`-char tokens via `LIKE`.
+- **Length caps & `tool_result` bodies**: `tool_result` bodies are not indexed in the FTS table (only conversation text and summarized `tool_use` inputs up to 2,000 chars are indexed in `messages`, with message text capped at 8,000 chars in both `messages` and `ccsi events`). For unindexed `tool_result` outputs, use `ccsi events --session <id> --kind tool_result` (up to 8,000 chars per event) or inspect the source `.jsonl` file.
+- **Append-only assumption & deleted transcripts**: Incremental indexing assumes existing `.jsonl` files are append-only (`st_ino` unchanged and `st_size` grown) and does not automatically purge rows for `.jsonl` files deleted from disk; remove `index.sqlite` and re-run `ccsi index` for a clean rebuild.
+
+## Tests
+
+```sh
+python3 test_ccsi.py -v
+```
+
+## License
+
+[MIT](/LICENSE)

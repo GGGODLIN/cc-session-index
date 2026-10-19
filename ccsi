@@ -8,15 +8,32 @@ import sqlite3
 import sys
 import time
 
-ROOTS = (
-  ("cc", os.path.expanduser("~/.claude/projects")),
-  ("codex", os.path.expanduser("~/.codex/sessions")),
-  ("codex", os.path.expanduser("~/.codex/archived_sessions")),
-  ("pi", os.path.expanduser("~/.pi/agent/sessions")),
-)
+def default_db_dir():
+  if os.environ.get("CCSI_DB_DIR"):
+    return os.path.expanduser(os.environ["CCSI_DB_DIR"])
+  if sys.platform == "darwin":
+    return os.path.expanduser("~/Library/Caches/cc-session-index")
+  xdg = os.environ.get("XDG_CACHE_HOME", "")
+  cache_home = xdg if os.path.isabs(xdg) else os.path.expanduser("~/.cache")
+  return os.path.join(cache_home, "cc-session-index")
+
+
+def build_roots():
+  cc_cfg = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+  codex_home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
+  pi_dir = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or "~/.pi/agent")
+  return (
+    ("cc", os.path.join(cc_cfg, "projects")),
+    ("codex", os.path.join(codex_home, "sessions")),
+    ("codex", os.path.join(codex_home, "archived_sessions")),
+    ("pi", os.path.join(pi_dir, "sessions")),
+  )
+
+
+ROOTS = build_roots()
 ROOT = ROOTS[0][1]
 VENDORS = ("cc", "codex", "pi")
-DB_DIR = os.path.expanduser("~/Library/Caches/cc-session-index")
+DB_DIR = default_db_dir()
 DB_PATH = os.path.join(DB_DIR, "index.sqlite")
 SCHEMA_VERSION = 2
 
@@ -51,26 +68,44 @@ SKILL_BASE_RE = re.compile(r"^\s*Base directory for this skill(?:\s*:|\s*\r?\n)"
 PURE_NOISE_RE = re.compile(r"^\s*<(?:local-command-caveat|local-command-stdout|system-reminder)\b")
 
 
+def set_private_mode(path, mode):
+  try:
+    os.chmod(path, mode)
+  except OSError:
+    pass
+
+
 def connect(upgrade=False):
-  os.makedirs(DB_DIR, exist_ok=True)
+  os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+  set_private_mode(DB_DIR, 0o700)
   db = sqlite3.connect(DB_PATH)
-  ver = db.execute("PRAGMA user_version").fetchone()[0]
-  if ver != SCHEMA_VERSION:
-    has_files = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone()
-    if not has_files:
+  set_private_mode(DB_PATH, 0o600)
+  try:
+    ver = db.execute("PRAGMA user_version").fetchone()[0]
+    if ver != SCHEMA_VERSION:
+      has_files = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone()
+      if not has_files:
+        db.executescript(SCHEMA)
+        db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        db.commit()
+      elif upgrade:
+        cols = {r[1] for r in db.execute("PRAGMA table_info(files)")}
+        has_refs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_refs'").fetchone()
+        if not {"offset", "ino", "rows"}.issubset(cols) or not has_refs:
+          db.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS message_refs; DROP TABLE IF EXISTS messages; VACUUM;")
+        db.executescript(SCHEMA)
+        db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        db.commit()
+    else:
       db.executescript(SCHEMA)
-      db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-      db.commit()
-    elif upgrade:
-      cols = {r[1] for r in db.execute("PRAGMA table_info(files)")}
-      has_refs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_refs'").fetchone()
-      if not {"offset", "ino", "rows"}.issubset(cols) or not has_refs:
-        db.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS message_refs; DROP TABLE IF EXISTS messages; VACUUM;")
-      db.executescript(SCHEMA)
-      db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-      db.commit()
-  else:
-    db.executescript(SCHEMA)
+  except sqlite3.OperationalError as e:
+    if "fts5" in str(e).lower() or "trigram" in str(e).lower():
+      print(
+        f"ccsi: SQLite 3.34.0+ with FTS5 trigram is required (running {sys.executable} with SQLite {sqlite3.sqlite_version}): {e}",
+        file=sys.stderr,
+      )
+      sys.exit(2)
+    raise
   return db
 
 
@@ -86,8 +121,7 @@ def iter_files(vendors):
     if vendor not in vendors or not os.path.isdir(root):
       continue
     for dirpath, dirs, names in os.walk(root):
-      # session-backup.sh mirrors Codex rollouts under ~/.claude/projects/codex;
-      # prune that subtree under vendor="cc" so it is not scanned twice.
+      # Prune mirrored Codex rollouts under <cc_root>/codex so they are not indexed twice.
       if vendor == "cc" and dirpath == root and "codex" in dirs:
         dirs.remove("codex")
       for n in names:
@@ -197,8 +231,9 @@ def cc_blocks(content):
       yield ("text", as_text(block.get("text", "")), None)
     elif btype == "tool_use":
       inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-      cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or ""
-      yield ("tool_call", as_text(cmd), {"tool": as_text(block.get("name", "")), "input": inp})
+      tname = as_text(block.get("name", ""))
+      cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or summarize_tool_input(tname, inp)
+      yield ("tool_call", as_text(cmd), {"tool": tname, "input": inp})
     elif btype == "tool_result":
       c = block.get("content")
       text = c if isinstance(c, str) else " ".join(as_text(x.get("text", "")) for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
@@ -391,9 +426,11 @@ def delete_file_messages(db, path):
 
 def cmd_index(args):
   t0 = time.time()
-  os.makedirs(DB_DIR, exist_ok=True)
+  os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
+  set_private_mode(DB_DIR, 0o700)
   lock_path = os.path.join(DB_DIR, "index.lock")
   with open(lock_path, "w") as lock_file:
+    set_private_mode(lock_path, 0o600)
     fcntl.flock(lock_file, fcntl.LOCK_EX)
     db = connect(upgrade=True)
     known = {
@@ -463,12 +500,19 @@ def cmd_index(args):
     print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
 
-FTS_SYNTAX_RE = re.compile(r'["*()^:]|\b(?:AND|OR|NOT|NEAR)\b')
+FTS_SYNTAX_RE = re.compile(r'["*()^:]|\b(?:AND|OR|NOT|NEAR(?:/\d+)?)\b')
 QUERY_TERM_RE = re.compile(r'"([^"]+)"|(\S+)')
+NEAR_OP_RE = re.compile(r"^NEAR(?:/\d+)?$")
 
 
 def literal_query(query):
-  return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
+  out = []
+  for token in query.split():
+    if token in ("AND", "OR", "NOT"):
+      out.append(token)
+    else:
+      out.append('"' + token.replace('"', '""') + '"')
+  return " ".join(out)
 
 
 def escape_like(token):
@@ -477,14 +521,19 @@ def escape_like(token):
 
 def parse_search_query(query):
   has_long_term = False
+  has_short_term = False
   for quoted, bare in QUERY_TERM_RE.findall(query):
     if quoted:
       if len(quoted) >= 3:
         has_long_term = True
-    elif bare not in ("AND", "OR", "NOT") and not bare.startswith("NEAR"):
+      else:
+        has_short_term = True
+    elif bare not in ("AND", "OR", "NOT") and not NEAR_OP_RE.match(bare):
       cleaned = bare.strip('"*()^')
       if len(cleaned) >= 3:
         has_long_term = True
+      elif cleaned:
+        has_short_term = True
   if not has_long_term:
     return None, []
   if not FTS_SYNTAX_RE.search(query):
@@ -493,6 +542,8 @@ def parse_search_query(query):
     short_tokens = [t for t in tokens if len(t) < 3]
     if short_tokens:
       return " ".join(long_tokens), short_tokens
+  elif has_short_term:
+    return None, []
   return query, []
 
 
@@ -501,7 +552,7 @@ def cmd_search(args):
   fts_query, short_tokens = parse_search_query(query)
   if fts_query is None:
     print(
-      f"query error: trigram index requires at least one >=3-char token or quoted phrase (got: {query})",
+      f"query error: trigram index requires >=3-char terms (or plain space-separated mixed terms without boolean/quoted <3-char tokens; got: {query})",
       file=sys.stderr,
     )
     sys.exit(2)
@@ -520,17 +571,20 @@ def cmd_search(args):
     params.extend(root + os.sep + "%" for root in roots)
   for ex in getattr(args, "exclude_session", None) or ():
     if ex:
-      sql += " AND +path NOT LIKE ?"
-      params.append(f"%{ex}%")
+      sql += " AND +path NOT LIKE ? ESCAPE '!'"
+      params.append(escape_like(ex))
   sql += " ORDER BY rank LIMIT ?"
   params.append(args.k)
   try:
     hits = db.execute(sql, params).fetchall()
-  except sqlite3.OperationalError:
+  except sqlite3.OperationalError as e:
+    if "locked" in str(e).lower() or "busy" in str(e).lower():
+      print(f"query error: {e}", file=sys.stderr)
+      sys.exit(1)
     try:
       hits = db.execute(sql, [literal_query(fts_query)] + params[1:]).fetchall()
-    except sqlite3.OperationalError as e:
-      print(f"query error: {e}", file=sys.stderr)
+    except sqlite3.OperationalError as e2:
+      print(f"query error: {e2}", file=sys.stderr)
       sys.exit(1)
   ctx_n = getattr(args, "context", 0) or 0
   for mid, path, ts, role, snip, full_text in hits:
@@ -577,14 +631,18 @@ def cmd_events(args):
           continue
       except OSError:
         continue
-    for ev in events_for(vendor, p):
-      if since and ev["ts"] and ev["ts"][:10] < since:
-        continue
-      if kinds and ev["kind"] not in kinds:
-        continue
-      if args.tool and ev.get("tool") != args.tool:
-        continue
-      out.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    try:
+      for ev in events_for(vendor, p):
+        if since and ev["ts"] and ev["ts"][:10] < since:
+          continue
+        if kinds and ev["kind"] not in kinds:
+          continue
+        if args.tool and (ev["kind"] != "tool_call" or ev.get("tool") != args.tool):
+          continue
+        out.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    except OSError as e:
+      print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
+      continue
 
 
 def main():
