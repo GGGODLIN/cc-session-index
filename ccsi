@@ -390,6 +390,7 @@ def delete_file_messages(db, path):
 
 
 def cmd_index(args):
+  t0 = time.time()
   os.makedirs(DB_DIR, exist_ok=True)
   lock_path = os.path.join(DB_DIR, "index.lock")
   with open(lock_path, "w") as lock_file:
@@ -403,7 +404,6 @@ def cmd_index(args):
       "SELECT max(coalesce((SELECT max(mid) FROM message_refs), 0), coalesce((SELECT max(id) FROM messages_docsize), 0))"
     ).fetchone()[0]
     scanned = updated = failed = 0
-    t0 = time.time()
     for vendor, p in iter_files(set(args.vendor or VENDORS)):
       try:
         st_pre = os.stat(p)
@@ -463,18 +463,57 @@ def cmd_index(args):
     print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
 
+FTS_SYNTAX_RE = re.compile(r'["*()^:]|\b(?:AND|OR|NOT|NEAR)\b')
+QUERY_TERM_RE = re.compile(r'"([^"]+)"|(\S+)')
+
+
 def literal_query(query):
   return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
 
 
+def escape_like(token):
+  return "%" + token.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+
+def parse_search_query(query):
+  has_long_term = False
+  for quoted, bare in QUERY_TERM_RE.findall(query):
+    if quoted:
+      if len(quoted) >= 3:
+        has_long_term = True
+    elif bare not in ("AND", "OR", "NOT") and not bare.startswith("NEAR"):
+      cleaned = bare.strip('"*()^')
+      if len(cleaned) >= 3:
+        has_long_term = True
+  if not has_long_term:
+    return None, []
+  if not FTS_SYNTAX_RE.search(query):
+    tokens = query.split()
+    long_tokens = [t for t in tokens if len(t) >= 3]
+    short_tokens = [t for t in tokens if len(t) < 3]
+    if short_tokens:
+      return " ".join(long_tokens), short_tokens
+  return query, []
+
+
 def cmd_search(args):
-  db = connect()
   query = " ".join(args.query)
+  fts_query, short_tokens = parse_search_query(query)
+  if fts_query is None:
+    print(
+      f"query error: trigram index requires at least one >=3-char token or quoted phrase (got: {query})",
+      file=sys.stderr,
+    )
+    sys.exit(2)
+  db = connect()
   sql = (
-    "SELECT rowid, path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 24) "
+    "SELECT rowid, path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 64), text "
     "FROM messages WHERE messages MATCH ?"
   )
-  params = [query]
+  params = [fts_query]
+  for st in short_tokens:
+    sql += " AND +text LIKE ? ESCAPE '!'"
+    params.append(escape_like(st))
   if args.vendor:
     roots = [root for vendor, root in ROOTS if vendor in args.vendor]
     sql += " AND (" + " OR ".join("+path LIKE ?" for _ in roots) + ")"
@@ -489,12 +528,12 @@ def cmd_search(args):
     hits = db.execute(sql, params).fetchall()
   except sqlite3.OperationalError:
     try:
-      hits = db.execute(sql, [literal_query(query)] + params[1:]).fetchall()
+      hits = db.execute(sql, [literal_query(fts_query)] + params[1:]).fetchall()
     except sqlite3.OperationalError as e:
       print(f"query error: {e}", file=sys.stderr)
       sys.exit(1)
   ctx_n = getattr(args, "context", 0) or 0
-  for mid, path, ts, role, snip in hits:
+  for mid, path, ts, role, snip, full_text in hits:
     vendor, root = vendor_of(path)
     rel = os.path.relpath(path, root)
     print(f"--- [{vendor}] {rel}  {ts}  [{role}]")
@@ -516,7 +555,7 @@ def cmd_search(args):
         crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
         if crow:
           print(f"  - [{crow[1]} {crow[0]}] {crow[2].replace(chr(10), ' ')[:300]}")
-      print(f"  > [{role} {ts}] {snip.replace(chr(10), ' ')[:300]}")
+      print(f"  > [{role} {ts}] {full_text.replace(chr(10), ' ')[:300]}")
       for cmid in after_mids:
         crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
         if crow:

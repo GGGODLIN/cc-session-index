@@ -27,11 +27,11 @@ ccsi events --session 97ac80ca --kind text
 治理問題兩端一起問的寫法：先 `ccsi events --since <日期> --kind tool_call` 落成一個 JSONL，再用 jq 依 `vendor` 分組；不要各寫一套解析。
 
 - 索引落點：`~/Library/Caches/cc-session-index/index.sqlite`
-- 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令字串），單則截 8000 字
-- tokenizer：FTS5 trigram——中文子字串直接可搜，query 給 3 字以上
-- 首次全量建索引會跳過不存在舊資料的新檔刪除；15,000 檔回歸測試由 14.4 秒降至 2.7 秒。2026-09-02 實測完整重建 39,465 檔耗時 184.3 秒，後續 7 檔增量耗時 8.7 秒
+- 索引粒度：訊息級（user / assistant 文字＋tool_use 的指令與關鍵參數摘要），單則截 8000 字
+- tokenizer：FTS5 trigram——中文子字串直接可搜，至少需包含一個 3 字以上詞或雙引號片語（如 `"測試 假綠"`）；純 `<3` 字詞查詢會回傳 exit 2 提示，普通空白分隔的長短詞混合查詢會對 `<3` 字詞附加 `LIKE` 過濾
+- 首次全量建索引會跳過不存在舊資料的新檔刪除；15,000 檔回歸測試由 14.4 秒降至 2.7 秒。2026-10-19 v2 實測完整重建 52,992 檔耗時 371.5 秒，後續暖快取 7 檔增量耗時 0.6 秒
 - `~/.local/bin/ccsi` 已連到本專案腳本
-- LaunchAgent `com.gggodlin.cc-session-index` 每 6 小時低優先度增量更新，log 在同一 cache 目錄
+- LaunchAgent `com.gggodlin.cc-session-index` 約每 15 分鐘（900 秒）低優先度背景增量更新，log 在同一 cache 目錄（剛發生的對話若尚未入庫可先跑 `ccsi index`）
 
 ## 已知限制
 

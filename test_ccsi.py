@@ -11,7 +11,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("ccsi")
 
 
-def run_ccsi(home, *args):
+def run_ccsi(home, *args, check=True):
   env = os.environ.copy()
   env["HOME"] = str(home)
   return subprocess.run(
@@ -19,7 +19,7 @@ def run_ccsi(home, *args):
     env=env,
     capture_output=True,
     text=True,
-    check=True,
+    check=check,
   )
 
 
@@ -346,6 +346,45 @@ class ObeliskEnhancementsTest(unittest.TestCase):
       evs = [json.loads(l) for l in run_ccsi(home, "events", "--vendor", "pi", "--since", "2026-10-19").stdout.splitlines()]
       self.assertEqual([e["kind"] for e in evs], ["session_meta", "text", "tool_call", "tool_result"])
       self.assertEqual(evs[1]["model"], "openai/gpt-5.6-luna")
+
+  def test_short_token_guard_mixed_like_and_context_central_row(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      s = home / ".claude/projects/probe/short-and-ctx.jsonl"
+      s.parent.mkdir(parents=True)
+      long_tail = "尾端關鍵結論九八七六五"
+      filler = "中段填充文字" * 20
+      s.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-10-19T02:00:01Z", "message": {"role": "user", "content": f"Herdr 左下角 狀態 100% 測試 假綠 {filler} {long_tail}"}}) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-10-19T02:00:02Z", "message": {"role": "user", "content": "Herdr 左下角 1000 無關內容"}}) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-10-19T02:00:03Z", "message": {"role": "user", "content": "betaneedle standalone row"}}) + "\n"
+      )
+      run_ccsi(home, "index")
+
+      pure_short = run_ccsi(home, "search", "白話", check=False)
+      self.assertEqual(pure_short.returncode, 2)
+      self.assertIn("trigram index requires at least one >=3-char token", pure_short.stderr)
+
+      two_shorts = run_ccsi(home, "search", "測試", "假綠", check=False)
+      self.assertEqual(two_shorts.returncode, 2)
+
+      quoted_phrase = run_ccsi(home, "search", '"測試 假綠"')
+      self.assertIn("short-and-ctx.jsonl", quoted_phrase.stdout)
+
+      mixed_hit = run_ccsi(home, "search", "Herdr", "左下角", "狀態")
+      self.assertEqual(mixed_hit.stdout.count("--- [cc]"), 1)
+
+      mixed_miss = run_ccsi(home, "search", "Herdr", "左下角", "亂講")
+      self.assertEqual(mixed_miss.stdout.strip(), "(no hits)")
+
+      escaped_pct = run_ccsi(home, "search", "Herdr", "左下角", "0%")
+      self.assertEqual(escaped_pct.stdout.count("--- [cc]"), 1)
+
+      or_query = run_ccsi(home, "search", "左下角 OR betaneedle")
+      self.assertEqual(or_query.stdout.count("--- [cc]"), 3)
+
+      ctx_out = run_ccsi(home, "search", "Herdr 左下角 狀態", "-C", "1").stdout
+      self.assertIn(long_tail, ctx_out)
 
 
 if __name__ == "__main__":
