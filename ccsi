@@ -739,6 +739,7 @@ def search_legacy(db, args, fts_query, short_tokens):
 
 
 SQLITE_LIKE_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+TS_RAW_RE = re.compile(r"^[0-9A-Za-zT:.\-+_ ]+$")
 
 
 def short_match(text, tokens):
@@ -755,6 +756,42 @@ def read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode):
   except OSError:
     return []
   return extractor(path, vendor, records=records)
+
+
+def prefilter_hit_by_ts(path, vendor, ts, role, short_tokens, indexed_size, indexed_inode):
+  # Fast negative filter for short-token queries: only JSON-parse lines containing ts_bytes.
+  # Returns True if a candidate line matches (caller still verifies exact ordinal),
+  # False if no line with ts can match, or None if the source file failed identity/read checks.
+  try:
+    opener = lambda name, flags: os.open(name, flags | os.O_NONBLOCK)
+    with open(path, "rb", opener=opener) as f:
+      st = os.fstat(f.fileno())
+      if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
+        return None
+      buf = f.read(st.st_size)
+  except OSError:
+    return None
+  ts_bytes = ts.encode("ascii")
+  matched = []
+  pos = buf.find(ts_bytes, 0)
+  while pos != -1:
+    line_start = buf.rfind(b"\n", 0, pos) + 1
+    nl = buf.find(b"\n", pos)
+    line_end = nl + 1 if nl != -1 else len(buf)
+    try:
+      obj = json.loads(buf[line_start:line_end].decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+      obj = None
+    if isinstance(obj, dict):
+      matched.append(obj)
+    pos = buf.find(ts_bytes, line_end)
+  if not matched:
+    return False
+  rows = extract_rows(path, vendor, records=matched)
+  return any(
+    (ts, role) == (source_ts, source_role) and short_match(text, short_tokens)
+    for text, _, source_ts, source_role in rows
+  )
 
 
 def snippet_for(temp, query, text):
@@ -783,6 +820,13 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
     for path, vendor, ordinal, ts, role, indexed_size, indexed_inode in hits:
       if path not in by_path:
+        if short_tokens and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
+          pre = prefilter_hit_by_ts(path, vendor, ts, role, short_tokens, indexed_size, indexed_inode)
+          if pre is None:
+            by_path[path] = []
+            continue
+          if not pre:
+            continue
         by_path[path] = read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode)
       rows = by_path[path]
       if ordinal >= len(rows):
