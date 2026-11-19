@@ -740,6 +740,7 @@ def search_legacy(db, args, fts_query, short_tokens):
 
 SQLITE_LIKE_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 TS_RAW_RE = re.compile(r"^[0-9A-Za-zT:.\-+_ ]+$")
+TS_KEY_BYTES = b'"timestamp":"'
 
 
 def short_match(text, tokens):
@@ -758,40 +759,181 @@ def read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode):
   return extractor(path, vendor, records=records)
 
 
-def prefilter_hit_by_ts(path, vendor, ts, role, short_tokens, indexed_size, indexed_inode):
-  # Fast negative filter for short-token queries: only JSON-parse lines containing ts_bytes.
-  # Returns True if a candidate line matches (caller still verifies exact ordinal),
-  # False if no line with ts can match, or None if the source file failed identity/read checks.
-  try:
-    opener = lambda name, flags: os.open(name, flags | os.O_NONBLOCK)
-    with open(path, "rb", opener=opener) as f:
-      st = os.fstat(f.fileno())
-      if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
-        return None
-      buf = f.read(st.st_size)
-  except OSError:
+def probe_ts_pread(fd, size, offset):
+  cur = offset
+  if cur > 0:
+    while cur < size:
+      ch = os.pread(fd, min(32768, size - cur), cur)
+      if not ch:
+        return None, size
+      nl = ch.find(b"\n")
+      if nl != -1:
+        cur += nl + 1
+        break
+      cur += len(ch)
+  limit = min(size, cur + 524288)
+  scan_pos = cur
+  overlap = b""
+  while scan_pos < limit:
+    ch = os.pread(fd, min(32768, limit - scan_pos), scan_pos)
+    if not ch:
+      break
+    buf = overlap + ch
+    idx = buf.find(TS_KEY_BYTES)
+    if idx != -1:
+      start = idx + len(TS_KEY_BYTES)
+      end = buf.find(b'"', start, start + 40)
+      if end != -1 and end - start >= 19:
+        return buf[start:end], scan_pos - len(overlap) + idx
+    overlap = buf[-64:]
+    scan_pos += len(ch)
+  return None, cur
+
+
+def seek_ts_lines_pread(fd, size, ts_bytes):
+  # Binary search over file bytes for ts_bytes; returns None on miss so caller falls back to full scan.
+  lo, hi = 0, size
+  for _ in range(18):
+    if hi - lo <= 32768:
+      break
+    mid = (lo + hi) // 2
+    mid_ts, mid_pos = probe_ts_pread(fd, size, mid)
+    if mid_ts is None:
+      hi = mid
+      continue
+    if mid_ts < ts_bytes:
+      lo = max(mid, mid_pos)
+    elif mid_ts > ts_bytes:
+      hi = mid
+    else:
+      lo = max(0, mid_pos - 8192)
+      hi = min(size, mid_pos + 16384)
+      break
+  win_lo = max(0, lo - 16384)
+  win_hi = min(size, hi + 16384)
+  buf = os.pread(fd, win_hi - win_lo, win_lo)
+  if win_hi < size and not buf.endswith(b"\n"):
+    cur = win_hi
+    extra = []
+    while cur < size:
+      ch = os.pread(fd, min(65536, size - cur), cur)
+      if not ch:
+        break
+      nl = ch.find(b"\n")
+      if nl != -1:
+        extra.append(ch[:nl + 1])
+        break
+      extra.append(ch)
+      cur += len(ch)
+    if extra:
+      buf += b"".join(extra)
+  pos = buf.find(ts_bytes, 0)
+  if pos == -1:
     return None
-  ts_bytes = ts.encode("ascii")
+  lines = []
+  while pos != -1:
+    ls = buf.rfind(b"\n", 0, pos)
+    nl = buf.find(b"\n", pos)
+    le = nl + 1 if nl != -1 else len(buf)
+    if ls == -1 and win_lo > 0:
+      cur = win_lo
+      pfx = []
+      while cur > 0:
+        step = max(0, cur - 65536)
+        ch = os.pread(fd, cur - step, step)
+        rnl = ch.rfind(b"\n")
+        if rnl != -1:
+          pfx.append(ch[rnl + 1:])
+          break
+        pfx.append(ch)
+        cur = step
+      pfx.reverse()
+      raw = b"".join(pfx) + buf[:le]
+    else:
+      raw = buf[ls + 1:le]
+    lines.append(raw)
+    pos = buf.find(ts_bytes, le)
+  return lines
+
+
+def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ts, role, short_tokens, tok_specs, indexed_mtime, indexed_size, indexed_inode, need_context):
+  # Returns ("invalid", None) if source failed identity/read check,
+  # ("reject", None) if proven unable to match short_tokens,
+  # ("direct", text) if unique (ts, role) in an unchanged file resolved the exact hit without full parse,
+  # or ("full", None) to fall through to read_hit_rows.
+  fd = -1
+  try:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
+      return "invalid", None
+    ts_bytes = ts.encode("ascii")
+    if st.st_size > 32768 and st.st_size == indexed_size and st.st_mtime == indexed_mtime:
+      dups = dup_cache.get(path_id)
+      if dups is None:
+        dups = set(db.execute(
+          "SELECT ts, role FROM message_refs WHERE path_id = ? GROUP BY ts, role HAVING count(*) > 1",
+          (path_id,),
+        ))
+        dup_cache[path_id] = dups
+      if (ts, role) not in dups:
+        cand_lines = seek_ts_lines_pread(fd, st.st_size, ts_bytes)
+        if cand_lines is not None:
+          objs = []
+          for raw in cand_lines:
+            try:
+              obj = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+              obj = None
+            if isinstance(obj, dict):
+              objs.append(obj)
+          if objs:
+            rows = extract_rows(path, vendor, records=objs)
+            matching = [text for text, _, source_ts, source_role in rows if (ts, role) == (source_ts, source_role)]
+            if len(matching) == 1:
+              if not short_match(matching[0], short_tokens):
+                return "reject", None
+              if not need_context:
+                return "direct", matching[0]
+              return "full", None
+    if not short_tokens:
+      return "full", None
+    buf = os.pread(fd, st.st_size, 0) if st.st_size > 0 else b""
+  except OSError:
+    return "invalid", None
+  finally:
+    if fd != -1:
+      os.close(fd)
   matched = []
   pos = buf.find(ts_bytes, 0)
   while pos != -1:
     line_start = buf.rfind(b"\n", 0, pos) + 1
     nl = buf.find(b"\n", pos)
     line_end = nl + 1 if nl != -1 else len(buf)
-    try:
-      obj = json.loads(buf[line_start:line_end].decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-      obj = None
-    if isinstance(obj, dict):
-      matched.append(obj)
+    raw = buf[line_start:line_end]
+    possible = True
+    for tb, is_ascii in tok_specs:
+      if is_ascii:
+        if tb not in raw.lower() and b"\\u" not in raw:
+          possible = False
+          break
+      elif tb not in raw and b"\\u" not in raw:
+        possible = False
+        break
+    if possible:
+      try:
+        obj = json.loads(raw.decode("utf-8", errors="replace"))
+      except json.JSONDecodeError:
+        obj = None
+      if isinstance(obj, dict):
+        matched.append(obj)
     pos = buf.find(ts_bytes, line_end)
   if not matched:
-    return False
+    return "reject", None
   rows = extract_rows(path, vendor, records=matched)
-  return any(
-    (ts, role) == (source_ts, source_role) and short_match(text, short_tokens)
-    for text, _, source_ts, source_role in rows
-  )
+  if any((ts, role) == (source_ts, source_role) and short_match(text, short_tokens) for text, _, source_ts, source_role in rows):
+    return "full", None
+  return "reject", None
 
 
 def snippet_for(temp, query, text):
@@ -807,7 +949,7 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
   if args.k == 0:
     return 0
   sql = (
-    "SELECT paths.path, paths.vendor, ordinal, ts, role, files.size, files.ino "
+    "SELECT paths.path_id, paths.path, paths.vendor, ordinal, ts, role, files.mtime, files.size, files.ino "
     "FROM messages JOIN message_refs ON mid = messages.rowid "
     "JOIN paths USING (path_id) JOIN files USING (path_id) "
     "WHERE messages MATCH ?"
@@ -815,18 +957,35 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
   filters, params = path_filters(args, "paths.path")
   hits, fts_query = query_matches(db, sql + filters + " ORDER BY rank", fts_query, params)
   by_path = {}
+  dup_cache = {}
+  tok_specs = [
+    (t.lower().encode("ascii"), True) if t.isascii() else (t.encode("utf-8"), False)
+    for t in short_tokens
+  ]
   found = 0
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
-    for path, vendor, ordinal, ts, role, indexed_size, indexed_inode in hits:
+    for path_id, path, vendor, ordinal, ts, role, indexed_mtime, indexed_size, indexed_inode in hits:
+      if path not in by_path and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
+        status, direct_text = resolve_or_prefilter_hit(
+          db, dup_cache, path_id, path, vendor, ts, role, short_tokens, tok_specs,
+          indexed_mtime, indexed_size, indexed_inode, args.context > 0,
+        )
+        if status == "invalid":
+          by_path[path] = []
+          continue
+        if status == "reject":
+          continue
+        if status == "direct":
+          snippet = snippet_for(temp, fts_query, direct_text)
+          if snippet is None:
+            continue
+          print_hit(path, ts, role, snippet)
+          found += 1
+          if found == args.k:
+            break
+          continue
       if path not in by_path:
-        if short_tokens and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
-          pre = prefilter_hit_by_ts(path, vendor, ts, role, short_tokens, indexed_size, indexed_inode)
-          if pre is None:
-            by_path[path] = []
-            continue
-          if not pre:
-            continue
         by_path[path] = read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode)
       rows = by_path[path]
       if ordinal >= len(rows):
