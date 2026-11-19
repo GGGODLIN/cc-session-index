@@ -7,6 +7,8 @@ import re
 import sqlite3
 import sys
 import time
+from contextlib import closing
+from pathlib import Path
 
 def default_db_dir():
   if os.environ.get("CCSI_DB_DIR"):
@@ -34,29 +36,34 @@ ROOTS = build_roots()
 ROOT = ROOTS[0][1]
 VENDORS = ("cc", "codex", "pi")
 DB_DIR = default_db_dir()
-DB_PATH = os.path.join(DB_DIR, "index.sqlite")
-SCHEMA_VERSION = 2
+DB_PATH = Path(DB_DIR) / "index.sqlite"
+SCHEMA_VERSION = 3
+EXTRACTOR_VERSION = 1
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS files (
-  path TEXT PRIMARY KEY,
+CREATE TABLE paths (
+  path_id INTEGER PRIMARY KEY,
+  path TEXT NOT NULL UNIQUE
+);
+CREATE TABLE files (
+  path_id INTEGER PRIMARY KEY REFERENCES paths(path_id),
   mtime REAL NOT NULL,
   size INTEGER NOT NULL,
-  offset INTEGER NOT NULL DEFAULT 0,
-  ino INTEGER NOT NULL DEFAULT 0,
-  rows INTEGER NOT NULL DEFAULT 0
+  offset INTEGER NOT NULL,
+  ino INTEGER NOT NULL,
+  rows INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS message_refs (
+CREATE TABLE message_refs (
   mid INTEGER PRIMARY KEY,
-  path TEXT NOT NULL
+  path_id INTEGER NOT NULL REFERENCES paths(path_id),
+  ordinal INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  role TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS message_refs_path_mid ON message_refs(path, mid);
-CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
-  text,
-  path UNINDEXED,
-  ts UNINDEXED,
-  role UNINDEXED,
-  tokenize='trigram'
+CREATE INDEX message_refs_path_id ON message_refs(path_id);
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE VIRTUAL TABLE messages USING fts5(
+  text, tokenize='trigram', content='', contentless_delete=1
 );
 """
 
@@ -75,38 +82,24 @@ def set_private_mode(path, mode):
     pass
 
 
-def connect(upgrade=False):
-  os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
-  set_private_mode(DB_DIR, 0o700)
-  db = sqlite3.connect(DB_PATH)
-  set_private_mode(DB_PATH, 0o600)
+def schema_version(db):
+  return db.execute("PRAGMA user_version").fetchone()[0]
+
+
+def current_extractor(db):
+  return db.execute("SELECT value FROM metadata WHERE key = 'extractor_version'").fetchone() == (EXTRACTOR_VERSION,)
+
+
+def initialize_index(db):
   try:
-    ver = db.execute("PRAGMA user_version").fetchone()[0]
-    if ver != SCHEMA_VERSION:
-      has_files = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'").fetchone()
-      if not has_files:
-        db.executescript(SCHEMA)
-        db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        db.commit()
-      elif upgrade:
-        cols = {r[1] for r in db.execute("PRAGMA table_info(files)")}
-        has_refs = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_refs'").fetchone()
-        if not {"offset", "ino", "rows"}.issubset(cols) or not has_refs:
-          db.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS message_refs; DROP TABLE IF EXISTS messages; VACUUM;")
-        db.executescript(SCHEMA)
-        db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        db.commit()
-    else:
-      db.executescript(SCHEMA)
-  except sqlite3.OperationalError as e:
-    if "fts5" in str(e).lower() or "trigram" in str(e).lower():
-      print(
-        f"ccsi: SQLite 3.34.0+ with FTS5 trigram is required (running {sys.executable} with SQLite {sqlite3.sqlite_version}): {e}",
-        file=sys.stderr,
-      )
-      sys.exit(2)
-    raise
-  return db
+    db.executescript(SCHEMA)
+  except sqlite3.OperationalError as exc:
+    if not any(term in str(exc).lower() for term in ("fts5", "trigram", "contentless_delete")):
+      raise
+    sys.exit(f"ccsi: SQLite 3.43+ with FTS5 trigram is required (running {sys.executable} with SQLite {sqlite3.sqlite_version}): {exc}")
+  db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+  db.execute("INSERT INTO metadata VALUES ('extractor_version', ?)", (EXTRACTOR_VERSION,))
+  db.commit()
 
 
 def vendor_of(path):
@@ -423,9 +416,90 @@ def extract_rows(path, vendor=None, records=None):
   return rows
 
 
-def delete_file_messages(db, path):
-  db.execute("DELETE FROM messages WHERE rowid IN (SELECT mid FROM message_refs WHERE path = ?)", (path,))
-  db.execute("DELETE FROM message_refs WHERE path = ?", (path,))
+def delete_file_messages(db, path_id):
+  db.execute("DELETE FROM messages WHERE rowid IN (SELECT mid FROM message_refs WHERE path_id = ?)", (path_id,))
+  db.execute("DELETE FROM message_refs WHERE path_id = ?", (path_id,))
+
+
+def update_index(db, vendors):
+  known = {
+    path: (mtime, size, offset, ino, rows, path_id)
+    for path, mtime, size, offset, ino, rows, path_id in db.execute(
+      "SELECT path, mtime, size, offset, ino, rows, path_id FROM files JOIN paths USING (path_id)"
+    )
+  }
+  next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
+  scanned = updated = failed = 0
+  for vendor, path in iter_files(vendors):
+    try:
+      st_pre = os.stat(path)
+    except OSError:
+      continue
+    scanned += 1
+    prev = known.get(path)
+    if prev is not None and prev[0] == st_pre.st_mtime and prev[1] == st_pre.st_size and prev[3] == st_pre.st_ino:
+      continue
+    can_append = (
+      prev is not None
+      and prev[3] == st_pre.st_ino
+      and st_pre.st_size > prev[1]
+      and prev[2] > 0
+    )
+    start_offset = prev[2] if can_append else 0
+    try:
+      st, new_offset, records = read_jsonl_records(path, start_offset)
+      if can_append and (st.st_ino != prev[3] or st.st_size <= prev[1]):
+        can_append = False
+        st, new_offset, records = read_jsonl_records(path)
+      rows = extract_rows(path, vendor, records=records)
+    except OSError as exc:
+      failed += 1
+      print(f"skip unreadable file: {path}: {exc}", file=sys.stderr)
+      continue
+    if prev is None:
+      path_id = db.execute("INSERT INTO paths (path) VALUES (?)", (path,)).lastrowid
+    else:
+      path_id = prev[5]
+      if not can_append:
+        delete_file_messages(db, path_id)
+    base_rows = prev[4] if can_append else 0
+    db.executemany(
+      "INSERT INTO messages (rowid, text) VALUES (?, ?)",
+      ((next_mid + i + 1, row[0]) for i, row in enumerate(rows)),
+    )
+    db.executemany(
+      "INSERT INTO message_refs (mid, path_id, ordinal, ts, role) VALUES (?, ?, ?, ?, ?)",
+      ((next_mid + i + 1, path_id, base_rows + i, ts, role) for i, (_, _, ts, role) in enumerate(rows)),
+    )
+    next_mid += len(rows)
+    db.execute(
+      "INSERT OR REPLACE INTO files (path_id, mtime, size, offset, ino, rows) VALUES (?, ?, ?, ?, ?, ?)",
+      (path_id, st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows)),
+    )
+    known[path] = (st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows), path_id)
+    updated += 1
+    if updated % 500 == 0:
+      db.commit()
+  db.commit()
+  total = db.execute("SELECT coalesce(sum(rows), 0) FROM files").fetchone()[0]
+  return scanned, updated, failed, total
+
+
+def rebuild_index(vendors, replacing):
+  staging = DB_PATH.with_suffix(".sqlite.rebuild")
+  staging.with_name(staging.name + "-journal").unlink(missing_ok=True)
+  staging.unlink(missing_ok=True)
+  staging.touch(mode=0o600, exist_ok=False)
+  try:
+    with closing(sqlite3.connect(staging)) as db:
+      initialize_index(db)
+      counts = update_index(db, vendors)
+    if replacing and counts[2]:
+      sys.exit("ccsi: rebuild could not read all discovered sessions; kept the existing index")
+    os.replace(staging, DB_PATH)
+    return counts
+  finally:
+    staging.unlink(missing_ok=True)
 
 
 def cmd_index(args):
@@ -433,74 +507,25 @@ def cmd_index(args):
   os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
   set_private_mode(DB_DIR, 0o700)
   lock_path = os.path.join(DB_DIR, "index.lock")
+  vendors = set(args.vendor or VENDORS)
   with open(lock_path, "w") as lock_file:
     set_private_mode(lock_path, 0o600)
     fcntl.flock(lock_file, fcntl.LOCK_EX)
-    db = connect(upgrade=True)
-    known = {
-      row[0]: (row[1], row[2], row[3], row[4], row[5])
-      for row in db.execute("SELECT path, mtime, size, offset, ino, rows FROM files")
-    }
-    next_mid = db.execute(
-      "SELECT max(coalesce((SELECT max(mid) FROM message_refs), 0), coalesce((SELECT max(id) FROM messages_docsize), 0))"
-    ).fetchone()[0]
-    scanned = updated = failed = 0
-    for vendor, p in iter_files(set(args.vendor or VENDORS)):
-      try:
-        st_pre = os.stat(p)
-      except OSError:
-        continue
-      scanned += 1
-      prev = known.get(p)
-      if prev is not None and prev[0] == st_pre.st_mtime and prev[1] == st_pre.st_size and prev[3] == st_pre.st_ino:
-        continue
-      can_append = (
-        prev is not None
-        and prev[3] == st_pre.st_ino
-        and st_pre.st_size > prev[1]
-        and prev[2] > 0
-      )
-      start_offset = prev[2] if can_append else 0
-      try:
-        st, new_offset, records = read_jsonl_records(p, start_offset)
-        if can_append and (st.st_ino != prev[3] or st.st_size <= prev[1]):
-          can_append = False
-          st, new_offset, records = read_jsonl_records(p, 0)
-        rows = extract_rows(p, vendor, records=records)
-      except OSError as e:
-        failed += 1
-        print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
-        continue
-      if prev is not None and not can_append:
-        delete_file_messages(db, p)
-        base_rows = 0
-      else:
-        base_rows = prev[4] if can_append else 0
-      fts_rows = []
-      ref_rows = []
-      for text, rpath, ts, role in rows:
-        next_mid += 1
-        fts_rows.append((next_mid, text, rpath, ts, role))
-        ref_rows.append((next_mid, rpath))
-      if fts_rows:
-        db.executemany(
-          "INSERT INTO messages (rowid, text, path, ts, role) VALUES (?, ?, ?, ?, ?)",
-          fts_rows,
-        )
-        db.executemany(
-          "INSERT INTO message_refs (mid, path) VALUES (?, ?)",
-          ref_rows,
-        )
-      db.execute(
-        "INSERT OR REPLACE INTO files (path, mtime, size, offset, ino, rows) VALUES (?, ?, ?, ?, ?, ?)",
-        (p, st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(fts_rows)),
-      )
-      known[p] = (st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(fts_rows))
-      updated += 1
-      if updated % 500 == 0:
-        db.commit()
-    db.commit()
-    total = db.execute("SELECT coalesce(sum(rows), 0) FROM files").fetchone()[0]
+    existing = DB_PATH.is_file()
+    counts = None
+    if existing:
+      set_private_mode(DB_PATH, 0o600)
+      with closing(sqlite3.connect(DB_PATH)) as db:
+        version = schema_version(db)
+        if version > SCHEMA_VERSION:
+          sys.exit("ccsi: the index was built by a newer ccsi version")
+        if version == SCHEMA_VERSION and current_extractor(db):
+          counts = update_index(db, vendors)
+      if counts is None and args.vendor:
+        sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+    if counts is None:
+      counts = rebuild_index(vendors, existing)
+    scanned, updated, failed, total = counts
     print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
 
@@ -551,51 +576,57 @@ def parse_search_query(query):
   return query, []
 
 
-def cmd_search(args):
-  query = " ".join(args.query)
-  fts_query, short_tokens = parse_search_query(query)
-  if fts_query is None:
-    print(
-      f"query error: trigram index requires >=3-char terms (or plain space-separated mixed terms without boolean/quoted <3-char tokens; got: {query})",
-      file=sys.stderr,
-    )
-    sys.exit(2)
-  db = connect()
+def path_filters(args, path_column):
+  sql, params = "", []
+  if args.vendor:
+    roots = [root for vendor, root in ROOTS if vendor in args.vendor]
+    sql += " AND (" + " OR ".join(f"{path_column} LIKE ?" for _ in roots) + ")"
+    params.extend(root + os.sep + "%" for root in roots)
+  for ex in args.exclude_session:
+    if ex:
+      sql += f" AND {path_column} NOT LIKE ? ESCAPE '!'"
+      params.append(escape_like(ex))
+  return sql, params
+
+
+def query_matches(db, sql, fts_query, params):
+  try:
+    return db.execute(sql, [fts_query, *params]), fts_query
+  except sqlite3.OperationalError as exc:
+    if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+      sys.exit(f"query error: {exc}")
+    fts_query = literal_query(fts_query)
+    try:
+      return db.execute(sql, [fts_query, *params]), fts_query
+    except sqlite3.OperationalError as retry_error:
+      sys.exit(f"query error: {retry_error}")
+
+
+def print_hit(path, ts, role, snippet):
+  vendor, root = vendor_of(path)
+  rel = os.path.relpath(path, root)
+  print(f"--- [{vendor}] {rel}  {ts}  [{role}]")
+  print(snippet.replace("\n", " ")[:500])
+
+
+def print_context(marker, ts, role, text):
+  print(f"  {marker} [{role} {ts}] {text.replace(chr(10), ' ')[:300]}")
+
+
+def search_legacy(db, args, fts_query, short_tokens):
+  # v2 searches can keep using the full-text copy while index builds v3 beside it.
   sql = (
     "SELECT rowid, path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 64), text "
     "FROM messages WHERE messages MATCH ?"
   )
-  params = [fts_query]
-  for st in short_tokens:
-    sql += " AND +text LIKE ? ESCAPE '!'"
-    params.append(escape_like(st))
-  if args.vendor:
-    roots = [root for vendor, root in ROOTS if vendor in args.vendor]
-    sql += " AND (" + " OR ".join("+path LIKE ?" for _ in roots) + ")"
-    params.extend(root + os.sep + "%" for root in roots)
-  for ex in getattr(args, "exclude_session", None) or ():
-    if ex:
-      sql += " AND +path NOT LIKE ? ESCAPE '!'"
-      params.append(escape_like(ex))
-  sql += " ORDER BY rank LIMIT ?"
-  params.append(args.k)
-  try:
-    hits = db.execute(sql, params).fetchall()
-  except sqlite3.OperationalError as e:
-    if "locked" in str(e).lower() or "busy" in str(e).lower():
-      print(f"query error: {e}", file=sys.stderr)
-      sys.exit(1)
-    try:
-      hits = db.execute(sql, [literal_query(fts_query)] + params[1:]).fetchall()
-    except sqlite3.OperationalError as e2:
-      print(f"query error: {e2}", file=sys.stderr)
-      sys.exit(1)
-  ctx_n = getattr(args, "context", 0) or 0
+  filters, path_params = path_filters(args, "+path")
+  sql += " AND +text LIKE ? ESCAPE '!'" * len(short_tokens)
+  sql += filters + " ORDER BY rank LIMIT ?"
+  params = [*(escape_like(token) for token in short_tokens), *path_params, args.k]
+  hits = query_matches(db, sql, fts_query, params)[0].fetchall()
+  ctx_n = args.context
   for mid, path, ts, role, snip, full_text in hits:
-    vendor, root = vendor_of(path)
-    rel = os.path.relpath(path, root)
-    print(f"--- [{vendor}] {rel}  {ts}  [{role}]")
-    print(snip.replace("\n", " ")[:500])
+    print_hit(path, ts, role, snip)
     if ctx_n > 0:
       before_mids = [
         r[0] for r in db.execute(
@@ -612,13 +643,105 @@ def cmd_search(args):
       for cmid in before_mids:
         crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
         if crow:
-          print(f"  - [{crow[1]} {crow[0]}] {crow[2].replace(chr(10), ' ')[:300]}")
-      print(f"  > [{role} {ts}] {full_text.replace(chr(10), ' ')[:300]}")
+          print_context("-", *crow)
+      print_context(">", ts, role, full_text)
       for cmid in after_mids:
         crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
         if crow:
-          print(f"  + [{crow[1]} {crow[0]}] {crow[2].replace(chr(10), ' ')[:300]}")
-  if not hits:
+          print_context("+", *crow)
+  return len(hits)
+
+
+SQLITE_LIKE_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def short_match(text, tokens):
+  if not tokens:
+    return True
+  # SQLite's default LIKE folds ASCII only and stops at an embedded NUL.
+  folded = text.split("\0", 1)[0].translate(SQLITE_LIKE_FOLD)
+  return all(token.translate(SQLITE_LIKE_FOLD) in folded for token in tokens)
+
+
+def read_hit_rows(path):
+  try:
+    _, _, records = read_jsonl_records(path)
+    return extract_rows(path, records=records)
+  except OSError:
+    return []
+
+
+def snippet_for(temp, query, text):
+  temp.execute("DELETE FROM excerpts")
+  temp.execute("INSERT INTO excerpts (text) VALUES (?)", (text,))
+  result = temp.execute(
+    "SELECT snippet(excerpts, 0, '>>>', '<<<', '…', 64) FROM excerpts WHERE excerpts MATCH ?",
+    (query,),
+  ).fetchone()
+  return result[0] if result else None
+
+
+def search_contentless(db, args, fts_query, short_tokens):
+  if args.k == 0:
+    return 0
+  sql = (
+    "SELECT paths.path, ordinal, ts, role "
+    "FROM messages JOIN message_refs ON mid = messages.rowid JOIN paths USING (path_id) "
+    "WHERE messages MATCH ?"
+  )
+  filters, params = path_filters(args, "paths.path")
+  hits, fts_query = query_matches(db, sql + filters + " ORDER BY rank", fts_query, params)
+  by_path = {}
+  found = 0
+  with closing(sqlite3.connect(":memory:")) as temp:
+    temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
+    for path, ordinal, ts, role in hits:
+      if path not in by_path:
+        by_path[path] = read_hit_rows(path)
+      rows = by_path[path]
+      if ordinal >= len(rows):
+        continue
+      text = rows[ordinal][0]
+      if not short_match(text, short_tokens):
+        continue
+      snippet = snippet_for(temp, fts_query, text)
+      if snippet is None:
+        continue
+      print_hit(path, ts, role, snippet)
+      if args.context > 0:
+        for adjacent, _, cts, crole in rows[max(0, ordinal - args.context):ordinal]:
+          print_context("-", cts, crole, adjacent)
+        print_context(">", ts, role, text)
+        for adjacent, _, cts, crole in rows[ordinal + 1:ordinal + 1 + args.context]:
+          print_context("+", cts, crole, adjacent)
+      found += 1
+      if found == args.k:
+        break
+  return found
+
+
+def cmd_search(args):
+  query = " ".join(args.query)
+  fts_query, short_tokens = parse_search_query(query)
+  if fts_query is None:
+    print(
+      f"query error: trigram index requires >=3-char terms (or plain space-separated mixed terms without boolean/quoted <3-char tokens; got: {query})",
+      file=sys.stderr,
+    )
+    sys.exit(2)
+  if not DB_PATH.is_file():
+    print("(no hits)")
+    return
+  with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+    db.execute("BEGIN")
+    version = schema_version(db)
+    if version < SCHEMA_VERSION:
+      found = search_legacy(db, args, fts_query, short_tokens)
+    elif version == SCHEMA_VERSION and current_extractor(db):
+      found = search_contentless(db, args, fts_query, short_tokens)
+    else:
+      sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
+  if not found:
     print("(no hits)")
 
 

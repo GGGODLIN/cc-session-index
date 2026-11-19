@@ -18,20 +18,114 @@ def db_path_for(home):
   return home / ".cache/cc-session-index/index.sqlite"
 
 
-def run_ccsi(home, *args, check=True, extra_env=None):
+LEGACY_SCRIPT = SCRIPT.parent / "testdata/ccsi-v2.py"
+
+
+def ccsi_env(home, extra_env=None):
   env = os.environ.copy()
   env["HOME"] = str(home)
   for k in ("CCSI_DB_DIR", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "XDG_CACHE_HOME"):
     env.pop(k, None)
   if extra_env:
     env.update(extra_env)
+  return env
+
+
+def run_ccsi(home, *args, check=True, extra_env=None, script=SCRIPT):
   return subprocess.run(
-    [sys.executable, str(SCRIPT), *args],
-    env=env,
+    [sys.executable, str(script), *args],
+    env=ccsi_env(home, extra_env),
     capture_output=True,
     text=True,
     check=check,
+    timeout=20,
   )
+
+
+def cc_session(home, name, text):
+  path = home / ".claude/projects/probe" / f"{name}.jsonl"
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps({
+    "type": "user", "timestamp": "2026-10-19T00:00:00Z",
+    "message": {"role": "user", "content": text},
+  }) + "\n")
+  return path
+
+
+class ContentlessUpgradeTest(unittest.TestCase):
+  def test_v2_upgrade_keeps_searchable_old_db_until_replace(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "old-session", "legacyneedle")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT)
+      database = db_path_for(home)
+      old_bytes = database.read_bytes()
+      old_hit = run_ccsi(home, "search", "legacyneedle", script=LEGACY_SCRIPT).stdout
+      self.assertIn("old-session.jsonl", old_hit)
+      cc_session(home, "new-session", "rebuiltneedle")
+
+      scoped = run_ccsi(home, "index", "--vendor", "cc", check=False)
+      self.assertNotEqual(scoped.returncode, 0)
+      self.assertIn("ccsi index", scoped.stderr)
+      self.assertEqual(database.read_bytes(), old_bytes)
+      self.assertEqual(run_ccsi(home, "search", "legacyneedle").stdout, old_hit)
+      self.assertEqual(run_ccsi(home, "search", "rebuiltneedle").stdout, "(no hits)\n")
+
+      run_ccsi(home, "index")
+      self.assertNotEqual(database.read_bytes(), old_bytes)
+      self.assertEqual(run_ccsi(home, "search", "legacyneedle").stdout, old_hit)
+      self.assertIn(">>>rebuiltneedle<<<", run_ccsi(home, "search", "rebuiltneedle", "--vendor", "cc").stdout)
+      self.assertEqual(run_ccsi(home, "search", "rebuiltneedle", "--exclude-session", "new-session").stdout,
+                       "(no hits)\n")
+
+  def test_interrupted_rebuild_preserves_old_db_and_discards_staging_on_retry(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = cc_session(home, "before", "interruptneedle")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT)
+      database = db_path_for(home)
+      staging = database.with_suffix(".sqlite.rebuild")
+      old_bytes = database.read_bytes()
+      old_hit = run_ccsi(home, "search", "interruptneedle", script=LEGACY_SCRIPT).stdout
+      fifo = session.with_name("pause.jsonl")
+      os.mkfifo(fifo)
+      with subprocess.Popen([sys.executable, str(SCRIPT), "index"], env=ccsi_env(home),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE) as rebuild:
+        try:
+          deadline = time.monotonic() + 5
+          while not staging.is_file() and rebuild.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+          self.assertTrue(staging.is_file(), "rebuild did not create a separate index")
+          self.assertIsNone(rebuild.poll())
+          self.assertEqual(database.read_bytes(), old_bytes)
+          self.assertEqual(run_ccsi(home, "search", "interruptneedle").stdout, old_hit)
+        finally:
+          rebuild.kill()
+          rebuild.communicate(timeout=5)
+      self.assertEqual(database.read_bytes(), old_bytes)
+      self.assertEqual(run_ccsi(home, "search", "interruptneedle").stdout, old_hit)
+      self.assertTrue(staging.is_file())
+      fifo.unlink()
+      cc_session(home, "after", "recoverneedle")
+      run_ccsi(home, "index")
+      self.assertFalse(staging.exists())
+      self.assertIn("after.jsonl", run_ccsi(home, "search", "recoverneedle").stdout)
+
+  def test_extractor_version_change_rebuilds_index(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "version", "versionneedle")
+      run_ccsi(home, "index")
+      database = db_path_for(home)
+      with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
+        db.execute("INSERT OR REPLACE INTO metadata VALUES ('extractor_version', 0)")
+      old_inode = database.stat().st_ino
+
+      rebuilt = run_ccsi(home, "index")
+      self.assertIn("updated=1", rebuilt.stdout)
+      self.assertNotEqual(database.stat().st_ino, old_inode)
+      self.assertIn(">>>versionneedle<<<", run_ccsi(home, "search", "versionneedle").stdout)
 
 
 class IndexSafetyTest(unittest.TestCase):
@@ -49,7 +143,7 @@ class IndexSafetyTest(unittest.TestCase):
       db_path = db_path_for(home)
       with closing(sqlite3.connect(db_path)) as db:
         before_mtime = db.execute(
-          "SELECT mtime FROM files WHERE path = ?",
+          "SELECT mtime FROM files JOIN paths USING (path_id) WHERE path = ?",
           (str(session),),
         ).fetchone()[0]
         before_count = db.execute(
@@ -66,7 +160,7 @@ class IndexSafetyTest(unittest.TestCase):
 
       with closing(sqlite3.connect(db_path)) as db:
         after_mtime = db.execute(
-          "SELECT mtime FROM files WHERE path = ?",
+          "SELECT mtime FROM files JOIN paths USING (path_id) WHERE path = ?",
           (str(session),),
         ).fetchone()[0]
         after_count = db.execute(
