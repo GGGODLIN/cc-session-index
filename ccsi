@@ -739,8 +739,35 @@ def search_legacy(db, args, fts_query, short_tokens):
 
 
 SQLITE_LIKE_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
-TS_RAW_RE = re.compile(r"^[0-9A-Za-zT:.\-+_ ]+$")
+TS_RAW_RE = re.compile(r"\A[0-9A-Za-zT:.\-+_ ]+\Z")
 TS_KEY_BYTES = b'"timestamp":"'
+PREAD_CHUNK_MAX = 64 * 1024 * 1024
+
+
+def pread_exact(fd, count, offset):
+  if count <= 0:
+    return b""
+  if count <= PREAD_CHUNK_MAX:
+    data = os.pread(fd, count, offset)
+    if len(data) == count:
+      return data
+    if not data:
+      return None
+    chunks = [data]
+    rem = count - len(data)
+    off = offset + len(data)
+  else:
+    chunks = []
+    rem = count
+    off = offset
+  while rem > 0:
+    ch = os.pread(fd, min(rem, PREAD_CHUNK_MAX), off)
+    if not ch:
+      return None
+    chunks.append(ch)
+    rem -= len(ch)
+    off += len(ch)
+  return b"".join(chunks)
 
 
 def short_match(text, tokens):
@@ -803,7 +830,7 @@ def seek_ts_spans_pread(fd, size, ts_bytes):
       hi = mid
       continue
     if mid_ts < ts_bytes:
-      lo = max(mid, mid_pos)
+      lo = min(hi, max(mid, mid_pos))
     elif mid_ts > ts_bytes:
       hi = mid
     else:
@@ -812,7 +839,11 @@ def seek_ts_spans_pread(fd, size, ts_bytes):
       break
   win_lo = max(0, lo - 16384)
   win_hi = min(size, hi + 16384)
-  buf = os.pread(fd, win_hi - win_lo, win_lo)
+  if win_hi <= win_lo:
+    return None
+  buf = pread_exact(fd, win_hi - win_lo, win_lo)
+  if buf is None:
+    return None
   if win_hi < size and not buf.endswith(b"\n"):
     cur = win_hi
     extra = []
@@ -842,7 +873,9 @@ def seek_ts_spans_pread(fd, size, ts_bytes):
       abs_ls = 0
       while cur > 0:
         step = max(0, cur - 65536)
-        ch = os.pread(fd, cur - step, step)
+        ch = pread_exact(fd, cur - step, step)
+        if ch is None:
+          return None
         rnl = ch.rfind(b"\n")
         if rnl != -1:
           pfx.append(ch[rnl + 1:])
@@ -878,7 +911,10 @@ def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, be
   tail = b""
   while len(collected_before) < need_before and cur > 0:
     step = max(0, cur - 65536)
-    chunk = os.pread(fd, cur - step, step) + tail
+    read_bytes = pread_exact(fd, cur - step, step)
+    if read_bytes is None:
+      return None, None
+    chunk = read_bytes + tail
     if step > 0:
       nl = chunk.find(b"\n")
       if nl == -1:
@@ -932,41 +968,56 @@ def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, be
   return collected_before, collected_after
 
 
-def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, tok_specs, indexed_mtime, indexed_size, indexed_inode, context_count):
-  # Returns ("invalid", None) if source failed identity/read check,
+def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, indexed_mtime, indexed_size, indexed_inode, context_count):
+  # Returns ("invalid", None) if source failed identity/open check,
   # ("reject", None) if proven unable to match short_tokens,
   # ("direct", (text, before_rows, after_rows)) if unique (ts, role) in an unchanged file
   # resolved the exact hit (and verified context neighbors when context_count > 0) without full parse,
   # or ("full", None) to fall through to read_hit_rows.
-  fd = -1
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    st = os.fstat(fd)
+  except OSError:
+    return "invalid", None
+  try:
+    try:
+      st = os.fstat(fd)
+    except OSError:
+      return "invalid", None
     if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
       return "invalid", None
     ts_bytes = ts.encode("ascii")
-    if st.st_size > 32768 and st.st_size == indexed_size and st.st_mtime == indexed_mtime:
+    unchanged = st.st_size == indexed_size and st.st_mtime == indexed_mtime
+    expected_tr_count = None
+    if unchanged:
       dups = dup_cache.get(path_id)
       if dups is None:
-        dups = set(db.execute(
-          "SELECT ts, role FROM message_refs WHERE path_id = ? GROUP BY ts, role HAVING count(*) > 1",
-          (path_id,),
-        ))
+        dups = {
+          (dts, drole): cnt
+          for dts, drole, cnt in db.execute(
+            "SELECT ts, role, count(*) FROM message_refs WHERE path_id = ? GROUP BY ts, role HAVING count(*) > 1",
+            (path_id,),
+          )
+        }
         dup_cache[path_id] = dups
-      if (ts, role) not in dups:
+      expected_tr_count = dups.get((ts, role), 1)
+    if st.st_size > 32768 and expected_tr_count is not None:
+      try:
         spans = seek_ts_spans_pread(fd, st.st_size, ts_bytes)
-        if spans is not None:
-          matched_entries = []
-          for ls, le, raw in spans:
-            rows = parse_single_line_rows(path, vendor, raw)
-            for r_idx, row in enumerate(rows):
-              if (ts, role) == (row[2], row[3]):
-                matched_entries.append((ls, le, rows, r_idx))
-          if len(matched_entries) == 1:
+      except OSError:
+        spans = None
+      if spans is not None:
+        matched_entries = []
+        for ls, le, raw in spans:
+          rows = parse_single_line_rows(path, vendor, raw)
+          for r_idx, row in enumerate(rows):
+            if (ts, role) == (row[2], row[3]):
+              matched_entries.append((ls, le, rows, r_idx))
+        if len(matched_entries) == expected_tr_count:
+          if not any(short_match(line_rows[r_idx][0], short_tokens) for _, _, line_rows, r_idx in matched_entries):
+            return "reject", None
+          if expected_tr_count == 1:
             ls, le, line_rows, r_idx = matched_entries[0]
             text = line_rows[r_idx][0]
-            if not short_match(text, short_tokens):
-              return "reject", None
             if context_count == 0:
               return "direct", (text, (), ())
             expected = db.execute(
@@ -975,50 +1026,48 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
             ).fetchall()
             exp_before = [(ets, erole) for eo, ets, erole in expected if eo < ordinal]
             exp_after = [(ets, erole) for eo, ets, erole in expected if eo > ordinal]
-            cb, ca = collect_local_context_pread(
-              fd, st.st_size, path, vendor, ls, le,
-              line_rows[:r_idx], line_rows[r_idx + 1:],
-              len(exp_before), len(exp_after),
-            )
-            if [(r[2], r[3]) for r in cb] == exp_before and [(r[2], r[3]) for r in ca] == exp_after:
+            try:
+              cb, ca = collect_local_context_pread(
+                fd, st.st_size, path, vendor, ls, le,
+                line_rows[:r_idx], line_rows[r_idx + 1:],
+                len(exp_before), len(exp_after),
+              )
+            except OSError:
+              cb, ca = None, None
+            if cb is not None and [(r[2], r[3]) for r in cb] == exp_before and [(r[2], r[3]) for r in ca] == exp_after:
               return "direct", (text, cb, ca)
             return "full", None
+          return "full", None
     if not short_tokens:
       return "full", None
-    buf = os.pread(fd, st.st_size, 0) if st.st_size > 0 else b""
-  except OSError:
-    return "invalid", None
+    try:
+      buf = pread_exact(fd, st.st_size, 0) if st.st_size > 0 else b""
+    except OSError:
+      return "full", None
+    if buf is None:
+      return "full", None
   finally:
-    if fd != -1:
-      os.close(fd)
+    os.close(fd)
   matched = []
   pos = buf.find(ts_bytes, 0)
   while pos != -1:
     line_start = buf.rfind(b"\n", 0, pos) + 1
     nl = buf.find(b"\n", pos)
     line_end = nl + 1 if nl != -1 else len(buf)
-    raw = buf[line_start:line_end]
-    possible = True
-    for tb, is_ascii in tok_specs:
-      if is_ascii:
-        if tb not in raw.lower() and b"\\u" not in raw:
-          possible = False
-          break
-      elif tb not in raw and b"\\u" not in raw:
-        possible = False
-        break
-    if possible:
-      try:
-        obj = json.loads(raw.decode("utf-8", errors="replace"))
-      except json.JSONDecodeError:
-        obj = None
-      if isinstance(obj, dict):
-        matched.append(obj)
+    try:
+      obj = json.loads(buf[line_start:line_end].decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+      obj = None
+    if isinstance(obj, dict):
+      matched.append(obj)
     pos = buf.find(ts_bytes, line_end)
-  if not matched:
+  rows = extract_rows(path, vendor, records=matched) if matched else []
+  matching_texts = [text for text, _, source_ts, source_role in rows if (ts, role) == (source_ts, source_role)]
+  if any(short_match(text, short_tokens) for text in matching_texts):
+    return "full", None
+  if expected_tr_count is not None and len(matching_texts) == expected_tr_count:
     return "reject", None
-  rows = extract_rows(path, vendor, records=matched)
-  if any((ts, role) == (source_ts, source_role) and short_match(text, short_tokens) for text, _, source_ts, source_role in rows):
+  if b"\\u" in buf:
     return "full", None
   return "reject", None
 
@@ -1077,17 +1126,13 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
   hits, fts_query = query_contentless_hits(db, args, fts_query)
   by_path = {}
   dup_cache = {}
-  tok_specs = [
-    (t.lower().encode("ascii"), True) if t.isascii() else (t.encode("utf-8"), False)
-    for t in short_tokens
-  ]
   found = 0
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
     for path_id, path, vendor, ordinal, ts, role, indexed_mtime, indexed_size, indexed_inode in hits:
       if path not in by_path and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
         status, payload = resolve_or_prefilter_hit(
-          db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, tok_specs,
+          db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens,
           indexed_mtime, indexed_size, indexed_inode, args.context,
         )
         if status == "invalid":
