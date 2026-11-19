@@ -133,6 +133,31 @@ class ContentlessUpgradeTest(unittest.TestCase):
       run_ccsi(home, "index")
       self.assertEqual(run_ccsi(home, "search", "codexneedle").stdout, initial)
 
+  def test_rebuild_skips_unreadable_file_only_if_it_was_never_indexed(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      indexed = cc_session(home, "indexed", "keptneedle")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT)
+      new = cc_session(home, "unindexed", "deferredneedle")
+      indexed.chmod(0)
+      new.chmod(0)
+      try:
+        blocked = run_ccsi(home, "index", check=False)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("kept the existing index", blocked.stderr)
+        self.assertIn(">>>keptneedle<<<", run_ccsi(home, "search", "keptneedle").stdout)
+        indexed.chmod(0o600)
+        rebuilt = run_ccsi(home, "index")
+        self.assertIn("updated=1 failed=1 rows=1 ", rebuilt.stdout)
+        self.assertIn(str(new), rebuilt.stderr)
+        self.assertIn(">>>keptneedle<<<", run_ccsi(home, "search", "keptneedle").stdout)
+        self.assertEqual(run_ccsi(home, "search", "deferredneedle").stdout, "(no hits)\n")
+      finally:
+        indexed.chmod(0o600)
+        new.chmod(0o600)
+      self.assertIn("updated=1 failed=0 rows=2 ", run_ccsi(home, "index").stdout)
+      self.assertIn(">>>deferredneedle<<<", run_ccsi(home, "search", "deferredneedle").stdout)
+
   def test_search_uses_the_indexed_extractor_during_version_rebuild(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
@@ -151,25 +176,11 @@ class ContentlessUpgradeTest(unittest.TestCase):
 EXTRACTORS = {1: extract_rows, 2: next_extract_rows}"""
       future.write_text(script.replace(old_mapping, next_mapping, 1))
       self.assertEqual(run_ccsi(home, "search", "indexedversionneedle", script=future).stdout, old)
-      run_ccsi(home, "index", script=future)
+      rebuild = run_ccsi(home, "index", script=future)
+      self.assertIn("updated=1 failed=0 rows=1 ", rebuild.stdout)
       rebuilt = run_ccsi(home, "search", "indexedversionneedle", script=future).stdout
       self.assertEqual(rebuilt, old.replace("<<<\n", "<<< nextversion\n"))
-
-  def test_extractor_version_change_rebuilds_index(self):
-    with tempfile.TemporaryDirectory() as tmp:
-      home = Path(tmp)
-      cc_session(home, "version", "versionneedle")
-      run_ccsi(home, "index")
-      database = db_path_for(home)
-      with sqlite3.connect(database) as db:
-        db.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL)")
-        db.execute("INSERT OR REPLACE INTO metadata VALUES ('extractor_version', 0)")
-      old_inode = database.stat().st_ino
-
-      rebuilt = run_ccsi(home, "index")
-      self.assertIn("updated=1", rebuilt.stdout)
-      self.assertNotEqual(database.stat().st_ino, old_inode)
-      self.assertIn(">>>versionneedle<<<", run_ccsi(home, "search", "versionneedle").stdout)
+      self.assertIn("updated=0 failed=0 rows=1 ", run_ccsi(home, "index", script=future).stdout)
 
 
 class ChangedSearchSourceTest(unittest.TestCase):
@@ -238,35 +249,6 @@ class ChangedSearchSourceTest(unittest.TestCase):
       self.assertIn(">>>codexneedle<<<", old)
       self.assertEqual(run_ccsi(home, "search", "codexneedle").stdout, old)
 
-  def test_unreadable_source_does_not_abort_search(self):
-    with tempfile.TemporaryDirectory() as tmp:
-      home = Path(tmp)
-      blocked = cc_session(home, "blocked", "readneedle")
-      available = cc_session(home, "available", "readneedle")
-      run_ccsi(home, "index")
-      self.assertIn(blocked.name, run_ccsi(home, "search", "readneedle").stdout)
-      blocked.chmod(0)
-      try:
-        result = run_ccsi(home, "search", "readneedle")
-      finally:
-        blocked.chmod(0o600)
-      self.assertIn(available.name, result.stdout)
-      self.assertNotIn(blocked.name, result.stdout)
-      self.assertEqual(result.stderr, "")
-
-  def test_append_keeps_old_hit_and_adds_new_neighbor(self):
-    with tempfile.TemporaryDirectory() as tmp:
-      home = Path(tmp)
-      path = cc_session(home, "append", "stablehit old text")
-      run_ccsi(home, "index")
-      before = run_ccsi(home, "search", "stablehit", "-C", "1").stdout
-      self.assertIn("  > [user 2026-10-19T00:00:00Z] stablehit old text\n", before)
-      with path.open("a") as file:
-        file.write(json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:01Z",
-                               "message": {"role": "assistant", "content": "appended neighbor"}}) + "\n")
-      after = run_ccsi(home, "search", "stablehit", "-C", "1").stdout
-      self.assertEqual(after, before + "  + [assistant 2026-10-19T00:00:01Z] appended neighbor\n")
-
   def test_short_term_filter_continues_beyond_the_first_candidates(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
@@ -320,7 +302,7 @@ class PruneDeletedSessionsTest(unittest.TestCase):
       self.assertIn("pi.jsonl", run_ccsi(home, "search", "pineedle").stdout)
       self.assertEqual(run_ccsi(home, "search", "deletedneedle").stdout, "(no hits)\n")
 
-  def test_missing_root_and_unreadable_file_preserve_index_entries(self):
+  def test_missing_root_preserves_index_entries(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
       path = cc_session(home, "restore", "restoreneedle")
@@ -333,15 +315,6 @@ class PruneDeletedSessionsTest(unittest.TestCase):
         self.assertIn("rows=1 ", run_ccsi(home, "index").stdout)
       finally:
         relocated.rename(root)
-      self.assertEqual(run_ccsi(home, "search", "restoreneedle").stdout, initial)
-      when = path.stat().st_mtime + 5
-      os.utime(path, (when, when))
-      path.chmod(0)
-      try:
-        report = run_ccsi(home, "index")
-        self.assertIn("failed=1 rows=1 ", report.stdout)
-      finally:
-        path.chmod(0o600)
       self.assertEqual(run_ccsi(home, "search", "restoreneedle").stdout, initial)
 
 
@@ -390,6 +363,8 @@ class SearchEquivalenceTest(unittest.TestCase):
           new = run_ccsi(home, "search", *args, text=False).stdout
           self.assertIn(expected.encode(), old)
           self.assertEqual(new, old)
+          if "-C" in args:
+            self.assertEqual(run_ccsi(home, "search", *args, extra_env=old_env, text=False).stdout, old)
           compared += 1
       self.assertGreater(compared, 0)
       print(f"\n{compared}/{len(cases)} CLI queries have identical stdout", flush=True)
@@ -398,7 +373,7 @@ class SearchEquivalenceTest(unittest.TestCase):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
       deleted = cc_session(home, "delete", "gonefromdisk")
-      appended = cc_session(home, "append", "anchorneedle")
+      appended = cc_session(home, "append", "anchorneedle old text")
       old_env = {"CCSI_DB_DIR": str(home / "old-index")}
       run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
       run_ccsi(home, "index")
@@ -407,7 +382,8 @@ class SearchEquivalenceTest(unittest.TestCase):
         return run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env).stdout
 
       original_context = old_search("anchorneedle", "-C", "1")
-      self.assertIn(">>>anchorneedle<<<", original_context)
+      self.assertIn(">>>anchorneedle<<< old text", original_context)
+      self.assertIn("  > [user 2026-10-19T00:00:00Z] anchorneedle old text\n", original_context)
       self.assertEqual(run_ccsi(home, "search", "anchorneedle", "-C", "1").stdout, original_context)
       self.assertIn(deleted.name, old_search("gonefromdisk"))
       self.assertIn(deleted.name, run_ccsi(home, "search", "gonefromdisk").stdout)
@@ -425,47 +401,30 @@ class SearchEquivalenceTest(unittest.TestCase):
 
 
 class IndexSafetyTest(unittest.TestCase):
-  def test_read_failure_preserves_existing_index_and_metadata(self):
+  def test_unreadable_file_is_skipped_without_losing_index_entries(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
-      session = home / ".claude/projects/probe/session.jsonl"
-      session.parent.mkdir(parents=True)
-      session.write_text(json.dumps({
-        "timestamp": "2026-08-14T00:00:00Z",
-        "message": {"role": "user", "content": "oldneedle"},
-      }) + "\n")
-      run_ccsi(home, "index")
+      blocked = cc_session(home, "blocked", "sharedreadneedle old text")
+      available = cc_session(home, "available", "sharedreadneedle other text")
+      self.assertIn("rows=2 ", run_ccsi(home, "index").stdout)
+      before = run_ccsi(home, "search", "sharedreadneedle").stdout
+      self.assertIn(blocked.name, before)
+      self.assertIn(available.name, before)
 
-      db_path = db_path_for(home)
-      with closing(sqlite3.connect(db_path)) as db:
-        before_mtime = db.execute(
-          "SELECT mtime FROM files JOIN paths USING (path_id) WHERE path = ?",
-          (str(session),),
-        ).fetchone()[0]
-        before_count = db.execute(
-          "SELECT count(*) FROM messages WHERE messages MATCH 'oldneedle'",
-        ).fetchone()[0]
-
-      changed_mtime = session.stat().st_mtime + 10
-      os.utime(session, (changed_mtime, changed_mtime))
-      session.chmod(0)
+      changed_mtime = blocked.stat().st_mtime + 10
+      os.utime(blocked, (changed_mtime, changed_mtime))
+      blocked.chmod(0)
       try:
-        run_ccsi(home, "index")
+        self.assertIn("updated=0 failed=1 rows=2 ", run_ccsi(home, "index").stdout)
+        result = run_ccsi(home, "search", "sharedreadneedle")
+        self.assertIn(available.name, result.stdout)
+        self.assertNotIn(blocked.name, result.stdout)
+        self.assertEqual(result.stderr, "")
       finally:
-        session.chmod(0o600)
+        blocked.chmod(0o600)
 
-      with closing(sqlite3.connect(db_path)) as db:
-        after_mtime = db.execute(
-          "SELECT mtime FROM files JOIN paths USING (path_id) WHERE path = ?",
-          (str(session),),
-        ).fetchone()[0]
-        after_count = db.execute(
-          "SELECT count(*) FROM messages WHERE messages MATCH 'oldneedle'",
-        ).fetchone()[0]
-
-      self.assertEqual(before_count, 1)
-      self.assertEqual(after_count, 1)
-      self.assertEqual(after_mtime, before_mtime)
+      self.assertEqual(run_ccsi(home, "search", "sharedreadneedle").stdout, before)
+      self.assertIn("updated=1 failed=0 rows=2 ", run_ccsi(home, "index").stdout)
 
   def test_changed_file_replaces_existing_messages(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +548,17 @@ class StructuredToolInputTest(unittest.TestCase):
 
 
 class SearchQueryTest(unittest.TestCase):
+  def test_empty_index_still_validates_query_syntax(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      old_env = {"CCSI_DB_DIR": str(home / "legacy")}
+      for query, code in (("missingneedle OR", 1), ("git-closeout", 0)):
+        with self.subTest(query=query):
+          expected = run_ccsi(home, "search", query, check=False, script=LEGACY_SCRIPT, extra_env=old_env)
+          result = run_ccsi(home, "search", query, check=False)
+          self.assertEqual(expected.returncode, code)
+          self.assertEqual((result.returncode, result.stdout, result.stderr),
+                           (expected.returncode, expected.stdout, expected.stderr))
   def test_queries_with_fts_punctuation_match_literally(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)

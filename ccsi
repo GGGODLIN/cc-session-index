@@ -93,13 +93,19 @@ def indexed_extractor_version(db):
   return row[0] if row else None
 
 
-def initialize_index(db):
+def execute_fts_schema(db, schema):
   try:
-    db.executescript(SCHEMA)
+    db.executescript(schema)
   except sqlite3.OperationalError as exc:
     if not any(term in str(exc).lower() for term in ("fts5", "trigram", "contentless_delete")):
       raise
-    sys.exit(f"ccsi: SQLite 3.43+ with FTS5 trigram is required (running {sys.executable} with SQLite {sqlite3.sqlite_version}): {exc}")
+    print(f"ccsi: SQLite 3.43+ with FTS5 trigram is required (running {sys.executable} with SQLite {sqlite3.sqlite_version}): {exc}",
+          file=sys.stderr)
+    sys.exit(2)
+
+
+def initialize_index(db):
+  execute_fts_schema(db, SCHEMA)
   db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
   db.execute("INSERT INTO metadata VALUES ('extractor_version', ?)", (EXTRACTOR_VERSION,))
   db.commit()
@@ -453,7 +459,7 @@ def prune_deleted_files(db, vendors, known, unseen):
       continue
 
 
-def update_index(db, vendors):
+def update_index(db, vendors, indexed_paths=frozenset()):
   known = {
     path: (mtime, size, offset, ino, rows, path_id)
     for path, mtime, size, offset, ino, rows, path_id in db.execute(
@@ -464,18 +470,27 @@ def update_index(db, vendors):
   next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
   scanned = updated = failed = 0
 
-  def record_read_error(exc):
+  def record_read_error(exc, path):
     nonlocal failed
     failed += 1
     print(f"skip unreadable source: {exc}", file=sys.stderr)
+    if path in indexed_paths:
+      sys.exit("ccsi: rebuild could not read an indexed session; kept the existing index")
 
-  for vendor, path in iter_files(vendors, onerror=record_read_error):
+  def record_walk_error(exc):
+    directory = exc.filename
+    if directory and any(path.startswith(directory + os.sep) for path in indexed_paths):
+      print(f"skip unreadable source: {exc}", file=sys.stderr)
+      sys.exit("ccsi: rebuild could not scan indexed sessions; kept the existing index")
+    record_read_error(exc, directory)
+
+  for vendor, path in iter_files(vendors, onerror=record_walk_error):
     try:
       st_pre = os.stat(path)
     except FileNotFoundError:
       continue
     except OSError as exc:
-      record_read_error(exc)
+      record_read_error(exc, path)
       continue
     unseen.discard(path)
     scanned += 1
@@ -496,7 +511,7 @@ def update_index(db, vendors):
         st, new_offset, records = read_jsonl_records(path)
       rows = EXTRACTORS[EXTRACTOR_VERSION](path, vendor, records=records)
     except OSError as exc:
-      record_read_error(exc)
+      record_read_error(exc, path)
       continue
     if prev is None:
       path_id = db.execute("INSERT INTO paths (path, vendor) VALUES (?, ?)", (path, vendor)).lastrowid
@@ -528,16 +543,11 @@ def update_index(db, vendors):
   return scanned, updated, failed, total
 
 
-def indexed_roots(db, version):
+def previously_indexed_paths(db, version):
   if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'files'").fetchone():
-    return []
+    return set()
   table = "paths" if version == SCHEMA_VERSION else "files"
-  required = []
-  for _, root in ROOTS:
-    prefix = root + os.sep
-    if db.execute(f"SELECT 1 FROM {table} WHERE substr(path, 1, ?) = ? LIMIT 1", (len(prefix), prefix)).fetchone():
-      required.append(root)
-  return required
+  return {path for (path,) in db.execute(f"SELECT path FROM {table}")}
 
 
 def require_roots_for_rebuild(roots):
@@ -546,7 +556,9 @@ def require_roots_for_rebuild(roots):
     sys.exit(f"ccsi: kept the existing index; rebuild source unavailable: {', '.join(missing)}")
 
 
-def rebuild_index(vendors, replacing, required_roots):
+def rebuild_index(vendors, indexed_paths):
+  required_roots = [root for vendor, root in ROOTS if vendor in vendors
+                    and any(path.startswith(root + os.sep) for path in indexed_paths)]
   require_roots_for_rebuild(required_roots)
   staging = DB_PATH.with_suffix(".sqlite.rebuild")
   staging.with_name(staging.name + "-journal").unlink(missing_ok=True)
@@ -555,9 +567,7 @@ def rebuild_index(vendors, replacing, required_roots):
   try:
     with closing(sqlite3.connect(staging)) as db:
       initialize_index(db)
-      counts = update_index(db, vendors)
-    if replacing and counts[2]:
-      sys.exit("ccsi: rebuild could not read all discovered sessions; kept the existing index")
+      counts = update_index(db, vendors, indexed_paths)
     require_roots_for_rebuild(required_roots)
     os.replace(staging, DB_PATH)
     return counts
@@ -576,7 +586,7 @@ def cmd_index(args):
     fcntl.flock(lock_file, fcntl.LOCK_EX)
     existing = DB_PATH.is_file()
     counts = None
-    required_roots = []
+    indexed_paths = frozenset()
     if existing:
       set_private_mode(DB_PATH, 0o600)
       with closing(sqlite3.connect(DB_PATH)) as db:
@@ -588,9 +598,9 @@ def cmd_index(args):
         elif args.vendor:
           sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
         else:
-          required_roots = indexed_roots(db, version)
+          indexed_paths = previously_indexed_paths(db, version)
     if counts is None:
-      counts = rebuild_index(vendors, existing, required_roots)
+      counts = rebuild_index(vendors, indexed_paths)
     scanned, updated, failed, total = counts
     print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
@@ -679,10 +689,25 @@ def print_context(marker, ts, role, text):
   print(f"  {marker} [{role} {ts}] {text.replace(chr(10), ' ')[:300]}")
 
 
+def legacy_context(db, path, mid, count):
+  return db.execute("""
+    WITH before_hit AS (
+      SELECT mid FROM message_refs WHERE path = :path AND mid < :mid ORDER BY mid DESC LIMIT :count
+    ), after_hit AS (
+      SELECT mid FROM message_refs WHERE path = :path AND mid > :mid ORDER BY mid ASC LIMIT :count
+    ), context_rows AS (
+      SELECT mid FROM before_hit UNION ALL SELECT :mid UNION ALL SELECT mid FROM after_hit
+    )
+    SELECT context_rows.mid, ts, role, text
+    FROM context_rows CROSS JOIN messages ON messages.rowid = context_rows.mid
+    ORDER BY context_rows.mid
+  """, {"path": path, "mid": mid, "count": count})
+
+
 def search_legacy(db, args, fts_query, short_tokens):
   # v2 searches can keep using the full-text copy while index builds v3 beside it.
   sql = (
-    "SELECT rowid, path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 64), text "
+    "SELECT rowid, path, ts, role, snippet(messages, 0, '>>>', '<<<', '…', 64) "
     "FROM messages WHERE messages MATCH ?"
   )
   filters, path_params = path_filters(args, "+path")
@@ -690,31 +715,12 @@ def search_legacy(db, args, fts_query, short_tokens):
   sql += filters + " ORDER BY rank LIMIT ?"
   params = [*(escape_like(token) for token in short_tokens), *path_params, args.k]
   hits = query_matches(db, sql, fts_query, params)[0].fetchall()
-  ctx_n = args.context
-  for mid, path, ts, role, snip, full_text in hits:
+  for mid, path, ts, role, snip in hits:
     print_hit(path, ts, role, snip)
-    if ctx_n > 0:
-      before_mids = [
-        r[0] for r in db.execute(
-          "SELECT mid FROM message_refs WHERE path = ? AND mid < ? ORDER BY mid DESC LIMIT ?",
-          (path, mid, ctx_n),
-        ).fetchall()
-      ][::-1]
-      after_mids = [
-        r[0] for r in db.execute(
-          "SELECT mid FROM message_refs WHERE path = ? AND mid > ? ORDER BY mid ASC LIMIT ?",
-          (path, mid, ctx_n),
-        ).fetchall()
-      ]
-      for cmid in before_mids:
-        crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
-        if crow:
-          print_context("-", *crow)
-      print_context(">", ts, role, full_text)
-      for cmid in after_mids:
-        crow = db.execute("SELECT ts, role, text FROM messages WHERE rowid = ?", (cmid,)).fetchone()
-        if crow:
-          print_context("+", *crow)
+    if args.context > 0:
+      for context_mid, context_ts, context_role, text in legacy_context(db, path, mid, args.context):
+        marker = "-" if context_mid < mid else "+" if context_mid > mid else ">"
+        print_context(marker, context_ts, context_role, text)
   return len(hits)
 
 
@@ -738,8 +744,7 @@ def read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode):
 
 
 def snippet_for(temp, query, text):
-  temp.execute("DELETE FROM excerpts")
-  temp.execute("INSERT INTO excerpts (text) VALUES (?)", (text,))
+  temp.execute("INSERT OR REPLACE INTO excerpts (rowid, text) VALUES (1, ?)", (text,))
   result = temp.execute(
     "SELECT snippet(excerpts, 0, '>>>', '<<<', '…', 64) FROM excerpts WHERE excerpts MATCH ?",
     (query,),
@@ -799,6 +804,10 @@ def cmd_search(args):
     )
     sys.exit(2)
   if not DB_PATH.is_file():
+    with closing(sqlite3.connect(":memory:")) as db:
+      execute_fts_schema(db, "CREATE VIRTUAL TABLE messages USING fts5("
+                            "text, path UNINDEXED, ts UNINDEXED, role UNINDEXED, tokenize='trigram')")
+      search_legacy(db, args, fts_query, short_tokens)
     print("(no hits)")
     return
   with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as db:
