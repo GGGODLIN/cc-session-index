@@ -128,6 +128,81 @@ class ContentlessUpgradeTest(unittest.TestCase):
       self.assertIn(">>>versionneedle<<<", run_ccsi(home, "search", "versionneedle").stdout)
 
 
+class ChangedSearchSourceTest(unittest.TestCase):
+  def test_missing_source_does_not_take_a_result_slot(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      paths = [cc_session(home, name, "sharedneedle") for name in ("first", "second")]
+      run_ccsi(home, "index")
+      before = run_ccsi(home, "search", "sharedneedle", "-k", "1").stdout
+      first, second = sorted(paths, key=lambda path: path.name not in before)
+      self.assertIn(first.name, before)
+      first.unlink()
+      after = run_ccsi(home, "search", "sharedneedle", "-k", "1").stdout
+      self.assertIn(second.name, after)
+      self.assertNotIn(first.name, after)
+
+  def test_shrunk_or_replaced_source_is_skipped_even_if_the_term_still_matches(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      shrunk = cc_session(home, "shrunk", "shrinkneedle extra words removed later")
+      replaced = cc_session(home, "replaced", "replaceneedle initial")
+      run_ccsi(home, "index")
+      self.assertIn(shrunk.name, run_ccsi(home, "search", "shrinkneedle").stdout)
+      self.assertIn(replaced.name, run_ccsi(home, "search", "replaceneedle").stdout)
+      cc_session(home, "shrunk", "shrinkneedle")
+      replacement = cc_session(home, "replacement", "replaceneedle updated with more words")
+      replacement.replace(replaced)
+      self.assertEqual(run_ccsi(home, "search", "shrinkneedle").stdout, "(no hits)\n")
+      self.assertEqual(run_ccsi(home, "search", "replaceneedle").stdout, "(no hits)\n")
+
+  def test_unreadable_source_does_not_abort_search(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      blocked = cc_session(home, "blocked", "readneedle")
+      available = cc_session(home, "available", "readneedle")
+      run_ccsi(home, "index")
+      self.assertIn(blocked.name, run_ccsi(home, "search", "readneedle").stdout)
+      blocked.chmod(0)
+      try:
+        result = run_ccsi(home, "search", "readneedle")
+      finally:
+        blocked.chmod(0o600)
+      self.assertIn(available.name, result.stdout)
+      self.assertNotIn(blocked.name, result.stdout)
+      self.assertEqual(result.stderr, "")
+
+  def test_append_keeps_old_hit_and_adds_new_neighbor(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      path = cc_session(home, "append", "stablehit old text")
+      run_ccsi(home, "index")
+      before = run_ccsi(home, "search", "stablehit", "-C", "1").stdout
+      self.assertIn("  > [user 2026-10-19T00:00:00Z] stablehit old text\n", before)
+      with path.open("a") as file:
+        file.write(json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:01Z",
+                               "message": {"role": "assistant", "content": "appended neighbor"}}) + "\n")
+      after = run_ccsi(home, "search", "stablehit", "-C", "1").stdout
+      self.assertEqual(after, before + "  + [assistant 2026-10-19T00:00:01Z] appended neighbor\n")
+
+  def test_short_term_filter_continues_beyond_the_first_candidates(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      for i in range(70):
+        cc_session(home, f"filler-{i}", "batchneedle")
+      cc_session(home, "matching-a", "batchneedle extra words ZX at end")
+      cc_session(home, "matching-b", "batchneedle extra words zx at end")
+      run_ccsi(home, "index")
+      self.assertIn("filler-", run_ccsi(home, "search", "batchneedle", "-k", "1").stdout)
+      first = run_ccsi(home, "search", "batchneedle", "zx", "-k", "1").stdout
+      self.assertEqual(first.count("--- [cc]"), 1)
+      self.assertIn("matching-", first)
+      exhausted = run_ccsi(home, "search", "batchneedle", "zx", "-k", "3").stdout
+      self.assertIn("matching-a.jsonl", exhausted)
+      self.assertIn("matching-b.jsonl", exhausted)
+      self.assertEqual(exhausted.count("--- [cc]"), 2)
+
+
 class IndexSafetyTest(unittest.TestCase):
   def test_read_failure_preserves_existing_index_and_metadata(self):
     with tempfile.TemporaryDirectory() as tmp:

@@ -663,12 +663,14 @@ def short_match(text, tokens):
   return all(token.translate(SQLITE_LIKE_FOLD) in folded for token in tokens)
 
 
-def read_hit_rows(path):
+def read_hit_rows(path, indexed_size, indexed_inode):
   try:
-    _, _, records = read_jsonl_records(path)
-    return extract_rows(path, records=records)
+    st, _, records = read_jsonl_records(path)
   except OSError:
     return []
+  if st.st_ino != indexed_inode or st.st_size < indexed_size:
+    return []
+  return extract_rows(path, records=records)
 
 
 def snippet_for(temp, query, text):
@@ -685,8 +687,9 @@ def search_contentless(db, args, fts_query, short_tokens):
   if args.k == 0:
     return 0
   sql = (
-    "SELECT paths.path, ordinal, ts, role "
-    "FROM messages JOIN message_refs ON mid = messages.rowid JOIN paths USING (path_id) "
+    "SELECT paths.path, ordinal, ts, role, files.size, files.ino "
+    "FROM messages JOIN message_refs ON mid = messages.rowid "
+    "JOIN paths USING (path_id) JOIN files USING (path_id) "
     "WHERE messages MATCH ?"
   )
   filters, params = path_filters(args, "paths.path")
@@ -695,9 +698,9 @@ def search_contentless(db, args, fts_query, short_tokens):
   found = 0
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
-    for path, ordinal, ts, role in hits:
+    for path, ordinal, ts, role, indexed_size, indexed_inode in hits:
       if path not in by_path:
-        by_path[path] = read_hit_rows(path)
+        by_path[path] = read_hit_rows(path, indexed_size, indexed_inode)
       rows = by_path[path]
       if ordinal >= len(rows):
         continue
