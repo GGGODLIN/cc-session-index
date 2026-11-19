@@ -263,6 +263,85 @@ class PruneDeletedSessionsTest(unittest.TestCase):
       self.assertEqual(run_ccsi(home, "search", "restoreneedle").stdout, initial)
 
 
+class SearchEquivalenceTest(unittest.TestCase):
+  def test_same_corpus_has_identical_legacy_and_contentless_stdout(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc = cc_session(home, "equivalence", "共用索引 queryneedle 0% Git settings.json\nsecond line")
+      with cc.open("a") as file:
+        for content in (
+          "<command-name>/review-spec</command-name><command-args>fixed packet</command-args>",
+          "<task-notification><summary>oracle task finished</summary><result>expected evidence</result></task-notification>",
+          [{"type": "tool_use", "name": "Bash", "input": {"command": "git-closeout"}}],
+          [{"type": "tool_use", "name": "Widget", "input": {"options": {"token": "structuredneedle"}}}],
+        ):
+          file.write(json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:01Z",
+                                 "message": {"role": "assistant", "content": content}}) + "\n")
+      write_codex_rollout(home / ".codex/sessions/probe/rollout.jsonl")
+      pi = home / ".pi/agent/sessions/probe/pi.jsonl"
+      pi.parent.mkdir(parents=True)
+      pi.write_text(json.dumps({"type": "message", "message": {"role": "user", "content": "pineedle 共用索引"}}) + "\n")
+      cc_session(home, "tied-one", "rankneedle")
+      cc_session(home, "tied-two", "rankneedle")
+      old_env = {"CCSI_DB_DIR": str(home / "old-index")}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+      cases = (
+        (("共用索引", "-C", "2"), ">>>共用索引<<<"),
+        (("settings.json",), ">>>settings.json<<<"),
+        (("queryneedle", "0%"), "0%"),
+        (("queryneedle", "pi"), "(no hits)\n"),
+        (("共用索引", "--vendor", "pi"), "--- [pi]"),
+        (("共用索引", "--exclude-session", "equivalence"), "--- [pi]"),
+        (("oracle task finished", "-C", "1"), "expected evidence"),
+        (("review-spec",), "fixed packet"),
+        (("git-closeout",), ">>>git-closeout<<<"),
+        (("structuredneedle",), "[Widget]"),
+        (("spawn_agent", "--vendor", "codex"), "--- [codex]"),
+        (("rankneedle", "-k", "1"), ">>>rankneedle<<<"),
+        (("never-indexed",), "(no hits)\n"),
+      )
+      compared = 0
+      for args, expected in cases:
+        with self.subTest(args=args):
+          old = run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env).stdout
+          new = run_ccsi(home, "search", *args).stdout
+          self.assertIn(expected, old)
+          self.assertEqual(new, old)
+          compared += 1
+      self.assertGreater(compared, 0)
+      print(f"\n{compared}/{len(cases)} CLI queries have identical stdout", flush=True)
+
+  def test_only_approved_fixture_changes_differ_between_versions(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      deleted = cc_session(home, "delete", "gonefromdisk")
+      appended = cc_session(home, "append", "anchorneedle")
+      old_env = {"CCSI_DB_DIR": str(home / "old-index")}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+
+      def old_search(*args):
+        return run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env).stdout
+
+      original_context = old_search("anchorneedle", "-C", "1")
+      self.assertIn(">>>anchorneedle<<<", original_context)
+      self.assertEqual(run_ccsi(home, "search", "anchorneedle", "-C", "1").stdout, original_context)
+      self.assertIn(deleted.name, old_search("gonefromdisk"))
+      self.assertIn(deleted.name, run_ccsi(home, "search", "gonefromdisk").stdout)
+      deleted.unlink()
+      with appended.open("a") as file:
+        file.write(json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:01Z",
+                               "message": {"role": "assistant", "content": "new adjacent row"}}) + "\n")
+      self.assertEqual(old_search("anchorneedle", "-C", "1"), original_context)
+      self.assertEqual(run_ccsi(home, "search", "anchorneedle", "-C", "1").stdout,
+                       original_context + "  + [assistant 2026-10-19T00:00:01Z] new adjacent row\n")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+      self.assertIn(deleted.name, old_search("gonefromdisk"))
+      self.assertEqual(run_ccsi(home, "search", "gonefromdisk").stdout, "(no hits)\n")
+
+
 class IndexSafetyTest(unittest.TestCase):
   def test_read_failure_preserves_existing_index_and_metadata(self):
     with tempfile.TemporaryDirectory() as tmp:
