@@ -790,8 +790,9 @@ def probe_ts_pread(fd, size, offset):
   return None, cur
 
 
-def seek_ts_lines_pread(fd, size, ts_bytes):
-  # Binary search over file bytes for ts_bytes; returns None on miss so caller falls back to full scan.
+def seek_ts_spans_pread(fd, size, ts_bytes):
+  # Binary search over file bytes for ts_bytes; returns list of (line_start, line_end, raw)
+  # or None on miss so caller falls back to full scan.
   lo, hi = 0, size
   for _ in range(18):
     if hi - lo <= 32768:
@@ -830,7 +831,7 @@ def seek_ts_lines_pread(fd, size, ts_bytes):
   pos = buf.find(ts_bytes, 0)
   if pos == -1:
     return None
-  lines = []
+  spans = []
   while pos != -1:
     ls = buf.rfind(b"\n", 0, pos)
     nl = buf.find(b"\n", pos)
@@ -838,28 +839,104 @@ def seek_ts_lines_pread(fd, size, ts_bytes):
     if ls == -1 and win_lo > 0:
       cur = win_lo
       pfx = []
+      abs_ls = 0
       while cur > 0:
         step = max(0, cur - 65536)
         ch = os.pread(fd, cur - step, step)
         rnl = ch.rfind(b"\n")
         if rnl != -1:
           pfx.append(ch[rnl + 1:])
+          abs_ls = step + rnl + 1
           break
         pfx.append(ch)
         cur = step
       pfx.reverse()
       raw = b"".join(pfx) + buf[:le]
     else:
+      abs_ls = win_lo + ls + 1
       raw = buf[ls + 1:le]
-    lines.append(raw)
+    spans.append((abs_ls, win_lo + le, raw))
     pos = buf.find(ts_bytes, le)
-  return lines
+  return spans
 
 
-def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ts, role, short_tokens, tok_specs, indexed_mtime, indexed_size, indexed_inode, need_context):
+def parse_single_line_rows(path, vendor, raw):
+  if vendor == "cc" and b'"message"' not in raw and b"\\u" not in raw:
+    return []
+  try:
+    obj = json.loads(raw.decode("utf-8", errors="replace"))
+  except json.JSONDecodeError:
+    return []
+  if not isinstance(obj, dict):
+    return []
+  return extract_rows(path, vendor, records=[obj])
+
+
+def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, before_rows, after_rows, need_before, need_after):
+  collected_before = list(before_rows)
+  cur = line_start
+  tail = b""
+  while len(collected_before) < need_before and cur > 0:
+    step = max(0, cur - 65536)
+    chunk = os.pread(fd, cur - step, step) + tail
+    if step > 0:
+      nl = chunk.find(b"\n")
+      if nl == -1:
+        tail = chunk
+        cur = step
+        continue
+      tail = chunk[:nl + 1]
+      complete = chunk[nl + 1:]
+    else:
+      tail = b""
+      complete = chunk
+    for raw in reversed(complete.split(b"\n")):
+      if not raw:
+        continue
+      rows = parse_single_line_rows(path, vendor, raw)
+      if rows:
+        collected_before = rows + collected_before
+        if len(collected_before) >= need_before:
+          break
+    cur = step
+  collected_before = collected_before[-need_before:] if need_before > 0 else []
+
+  collected_after = list(after_rows)
+  cur = line_end
+  head = b""
+  while len(collected_after) < need_after and cur < size:
+    read_bytes = os.pread(fd, min(65536, size - cur), cur)
+    if not read_bytes:
+      break
+    cur += len(read_bytes)
+    chunk = head + read_bytes
+    if cur < size:
+      nl = chunk.rfind(b"\n")
+      if nl == -1:
+        head = chunk
+        continue
+      complete = chunk[:nl + 1]
+      head = chunk[nl + 1:]
+    else:
+      complete = chunk
+      head = b""
+    for raw in complete.split(b"\n"):
+      if not raw:
+        continue
+      rows = parse_single_line_rows(path, vendor, raw)
+      if rows:
+        collected_after.extend(rows)
+        if len(collected_after) >= need_after:
+          break
+  collected_after = collected_after[:need_after]
+  return collected_before, collected_after
+
+
+def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, tok_specs, indexed_mtime, indexed_size, indexed_inode, context_count):
   # Returns ("invalid", None) if source failed identity/read check,
   # ("reject", None) if proven unable to match short_tokens,
-  # ("direct", text) if unique (ts, role) in an unchanged file resolved the exact hit without full parse,
+  # ("direct", (text, before_rows, after_rows)) if unique (ts, role) in an unchanged file
+  # resolved the exact hit (and verified context neighbors when context_count > 0) without full parse,
   # or ("full", None) to fall through to read_hit_rows.
   fd = -1
   try:
@@ -877,25 +954,35 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ts, role, sho
         ))
         dup_cache[path_id] = dups
       if (ts, role) not in dups:
-        cand_lines = seek_ts_lines_pread(fd, st.st_size, ts_bytes)
-        if cand_lines is not None:
-          objs = []
-          for raw in cand_lines:
-            try:
-              obj = json.loads(raw.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-              obj = None
-            if isinstance(obj, dict):
-              objs.append(obj)
-          if objs:
-            rows = extract_rows(path, vendor, records=objs)
-            matching = [text for text, _, source_ts, source_role in rows if (ts, role) == (source_ts, source_role)]
-            if len(matching) == 1:
-              if not short_match(matching[0], short_tokens):
-                return "reject", None
-              if not need_context:
-                return "direct", matching[0]
-              return "full", None
+        spans = seek_ts_spans_pread(fd, st.st_size, ts_bytes)
+        if spans is not None:
+          matched_entries = []
+          for ls, le, raw in spans:
+            rows = parse_single_line_rows(path, vendor, raw)
+            for r_idx, row in enumerate(rows):
+              if (ts, role) == (row[2], row[3]):
+                matched_entries.append((ls, le, rows, r_idx))
+          if len(matched_entries) == 1:
+            ls, le, line_rows, r_idx = matched_entries[0]
+            text = line_rows[r_idx][0]
+            if not short_match(text, short_tokens):
+              return "reject", None
+            if context_count == 0:
+              return "direct", (text, (), ())
+            expected = db.execute(
+              "SELECT ordinal, ts, role FROM message_refs WHERE path_id = ? AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
+              (path_id, max(0, ordinal - context_count), ordinal + context_count),
+            ).fetchall()
+            exp_before = [(ets, erole) for eo, ets, erole in expected if eo < ordinal]
+            exp_after = [(ets, erole) for eo, ets, erole in expected if eo > ordinal]
+            cb, ca = collect_local_context_pread(
+              fd, st.st_size, path, vendor, ls, le,
+              line_rows[:r_idx], line_rows[r_idx + 1:],
+              len(exp_before), len(exp_after),
+            )
+            if [(r[2], r[3]) for r in cb] == exp_before and [(r[2], r[3]) for r in ca] == exp_after:
+              return "direct", (text, cb, ca)
+            return "full", None
     if not short_tokens:
       return "full", None
     buf = os.pread(fd, st.st_size, 0) if st.st_size > 0 else b""
@@ -999,9 +1086,9 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
     for path_id, path, vendor, ordinal, ts, role, indexed_mtime, indexed_size, indexed_inode in hits:
       if path not in by_path and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
-        status, direct_text = resolve_or_prefilter_hit(
-          db, dup_cache, path_id, path, vendor, ts, role, short_tokens, tok_specs,
-          indexed_mtime, indexed_size, indexed_inode, args.context > 0,
+        status, payload = resolve_or_prefilter_hit(
+          db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, tok_specs,
+          indexed_mtime, indexed_size, indexed_inode, args.context,
         )
         if status == "invalid":
           by_path[path] = []
@@ -1009,10 +1096,17 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
         if status == "reject":
           continue
         if status == "direct":
+          direct_text, before_rows, after_rows = payload
           snippet = snippet_for(temp, fts_query, direct_text)
           if snippet is None:
             continue
           print_hit(path, ts, role, snippet)
+          if args.context > 0:
+            for adjacent, _, cts, crole in before_rows:
+              print_context("-", cts, crole, adjacent)
+            print_context(">", ts, role, direct_text)
+            for adjacent, _, cts, crole in after_rows:
+              print_context("+", cts, crole, adjacent)
           found += 1
           if found == args.k:
             break
