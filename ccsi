@@ -945,17 +945,49 @@ def snippet_for(temp, query, text):
   return result[0] if result else None
 
 
-def search_contentless(db, extractor, args, fts_query, short_tokens):
-  if args.k == 0:
-    return 0
+def query_contentless_hits(db, args, fts_query):
+  filters, params = path_filters(args, "paths.path")
+  if args.vendor:
+    pmap = {
+      pid: (path, vendor, mtime, size, ino)
+      for pid, path, vendor, mtime, size, ino in db.execute(
+        "SELECT paths.path_id, paths.path, paths.vendor, files.mtime, files.size, files.ino "
+        "FROM paths JOIN files USING (path_id) WHERE 1=1" + filters,
+        params,
+      )
+    }
+    if 0 < len(pmap) <= 500:
+      pids = list(pmap)
+      placeholders = ",".join("?" * len(pids))
+      lo_mid, hi_mid = db.execute(
+        f"SELECT min(mid), max(mid) FROM message_refs WHERE path_id IN ({placeholders})",
+        pids,
+      ).fetchone()
+      if lo_mid is not None:
+        sql = (
+          "SELECT message_refs.path_id, ordinal, ts, role "
+          "FROM messages JOIN message_refs ON mid = messages.rowid "
+          f"WHERE messages MATCH ? AND messages.rowid >= ? AND messages.rowid <= ? "
+          f"AND message_refs.path_id IN ({placeholders}) ORDER BY rank"
+        )
+        cur, fts_query = query_matches(db, sql, fts_query, [lo_mid, hi_mid, *pids])
+        return (
+          (pid, *pmap[pid][:2], ordinal, ts, role, *pmap[pid][2:])
+          for pid, ordinal, ts, role in cur
+        ), fts_query
   sql = (
     "SELECT paths.path_id, paths.path, paths.vendor, ordinal, ts, role, files.mtime, files.size, files.ino "
     "FROM messages JOIN message_refs ON mid = messages.rowid "
     "JOIN paths USING (path_id) JOIN files USING (path_id) "
     "WHERE messages MATCH ?"
   )
-  filters, params = path_filters(args, "paths.path")
-  hits, fts_query = query_matches(db, sql + filters + " ORDER BY rank", fts_query, params)
+  return query_matches(db, sql + filters + " ORDER BY rank", fts_query, params)
+
+
+def search_contentless(db, extractor, args, fts_query, short_tokens):
+  if args.k == 0:
+    return 0
+  hits, fts_query = query_contentless_hits(db, args, fts_query)
   by_path = {}
   dup_cache = {}
   tok_specs = [
