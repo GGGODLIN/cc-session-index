@@ -31,14 +31,14 @@ def ccsi_env(home, extra_env=None):
   return env
 
 
-def run_ccsi(home, *args, check=True, extra_env=None, script=SCRIPT):
+def run_ccsi(home, *args, check=True, extra_env=None, script=SCRIPT, timeout=20, text=True):
   return subprocess.run(
     [sys.executable, str(script), *args],
     env=ccsi_env(home, extra_env),
     capture_output=True,
-    text=True,
+    text=text,
     check=check,
-    timeout=20,
+    timeout=timeout,
   )
 
 
@@ -111,6 +111,50 @@ class ContentlessUpgradeTest(unittest.TestCase):
       self.assertFalse(staging.exists())
       self.assertIn("after.jsonl", run_ccsi(home, "search", "recoverneedle").stdout)
 
+  def test_missing_indexed_source_blocks_rebuild_until_restored(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "legacy", "preserveneedle")
+      write_codex_rollout(home / ".codex/sessions/probe/rollout.jsonl")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT)
+      initial = run_ccsi(home, "search", "codexneedle").stdout
+      self.assertIn("rollout.jsonl", initial)
+      db = db_path_for(home)
+      old = db.read_bytes()
+      codex = home / ".codex"
+      moved = codex.rename(home / "codex-away")
+      try:
+        result = run_ccsi(home, "index", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("existing index", result.stderr)
+        self.assertEqual(db.read_bytes(), old)
+      finally:
+        moved.rename(codex)
+      run_ccsi(home, "index")
+      self.assertEqual(run_ccsi(home, "search", "codexneedle").stdout, initial)
+
+  def test_search_uses_the_indexed_extractor_during_version_rebuild(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "version", "indexedversionneedle")
+      run_ccsi(home, "index")
+      old = run_ccsi(home, "search", "indexedversionneedle").stdout
+      self.assertIn(">>>indexedversionneedle<<<", old)
+      future = home / "ccsi-next.py"
+      script = SCRIPT.read_text().replace("EXTRACTOR_VERSION = 1", "EXTRACTOR_VERSION = 2", 1)
+      old_mapping = "EXTRACTORS = {1: extract_rows}"
+      next_mapping = """def next_extract_rows(path, vendor=None, records=None):
+  return [(text + ' nextversion', source, ts, role)
+          for text, source, ts, role in extract_rows(path, vendor, records)]
+
+
+EXTRACTORS = {1: extract_rows, 2: next_extract_rows}"""
+      future.write_text(script.replace(old_mapping, next_mapping, 1))
+      self.assertEqual(run_ccsi(home, "search", "indexedversionneedle", script=future).stdout, old)
+      run_ccsi(home, "index", script=future)
+      rebuilt = run_ccsi(home, "search", "indexedversionneedle", script=future).stdout
+      self.assertEqual(rebuilt, old.replace("<<<\n", "<<< nextversion\n"))
+
   def test_extractor_version_change_rebuilds_index(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
@@ -155,6 +199,44 @@ class ChangedSearchSourceTest(unittest.TestCase):
       replacement.replace(replaced)
       self.assertEqual(run_ccsi(home, "search", "shrinkneedle").stdout, "(no hits)\n")
       self.assertEqual(run_ccsi(home, "search", "replaceneedle").stdout, "(no hits)\n")
+
+  def test_rewritten_row_does_not_mix_new_text_and_old_timestamp(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      path = cc_session(home, "rewritten", "sameneedle old")
+      run_ccsi(home, "index")
+      self.assertIn(">>>sameneedle<<< old", run_ccsi(home, "search", "sameneedle").stdout)
+      raw = path.read_text().replace("sameneedle old", "sameneedle new").replace("00:00:00Z", "00:00:01Z")
+      self.assertEqual(len(raw.encode()), path.stat().st_size)
+      path.write_text(raw)
+      self.assertEqual(run_ccsi(home, "search", "sameneedle").stdout, "(no hits)\n")
+
+  def test_replaced_pipe_does_not_block_search(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      replaced = cc_session(home, "replaced", "pipeneedle")
+      available = cc_session(home, "available", "pipeneedle")
+      run_ccsi(home, "index")
+      self.assertIn(replaced.name, run_ccsi(home, "search", "pipeneedle").stdout)
+      fifo = replaced.with_name("replacement.pipe")
+      os.mkfifo(fifo)
+      fifo.replace(replaced)
+      result = run_ccsi(home, "search", "pipeneedle", timeout=3)
+      self.assertIn(available.name, result.stdout)
+      self.assertNotIn(replaced.name, result.stdout)
+
+  def test_codex_hit_uses_parser_recorded_when_indexed(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      codex = home / "custom-codex"
+      write_codex_rollout(codex / "sessions/probe/rollout.jsonl")
+      extra = {"CODEX_HOME": str(codex)}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env={**extra, "CCSI_DB_DIR": str(home / "legacy")})
+      run_ccsi(home, "index", extra_env=extra)
+      old = run_ccsi(home, "search", "codexneedle", script=LEGACY_SCRIPT,
+                     extra_env={"CCSI_DB_DIR": str(home / "legacy")}).stdout
+      self.assertIn(">>>codexneedle<<<", old)
+      self.assertEqual(run_ccsi(home, "search", "codexneedle").stdout, old)
 
   def test_unreadable_source_does_not_abort_search(self):
     with tempfile.TemporaryDirectory() as tmp:
@@ -304,9 +386,9 @@ class SearchEquivalenceTest(unittest.TestCase):
       compared = 0
       for args, expected in cases:
         with self.subTest(args=args):
-          old = run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env).stdout
-          new = run_ccsi(home, "search", *args).stdout
-          self.assertIn(expected, old)
+          old = run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env, text=False).stdout
+          new = run_ccsi(home, "search", *args, text=False).stdout
+          self.assertIn(expected.encode(), old)
           self.assertEqual(new, old)
           compared += 1
       self.assertGreater(compared, 0)

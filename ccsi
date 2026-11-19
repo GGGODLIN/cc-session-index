@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 from contextlib import closing
@@ -43,7 +44,8 @@ EXTRACTOR_VERSION = 1
 SCHEMA = """
 CREATE TABLE paths (
   path_id INTEGER PRIMARY KEY,
-  path TEXT NOT NULL UNIQUE
+  path TEXT NOT NULL UNIQUE,
+  vendor TEXT NOT NULL
 );
 CREATE TABLE files (
   path_id INTEGER PRIMARY KEY REFERENCES paths(path_id),
@@ -86,8 +88,9 @@ def schema_version(db):
   return db.execute("PRAGMA user_version").fetchone()[0]
 
 
-def current_extractor(db):
-  return db.execute("SELECT value FROM metadata WHERE key = 'extractor_version'").fetchone() == (EXTRACTOR_VERSION,)
+def indexed_extractor_version(db):
+  row = db.execute("SELECT value FROM metadata WHERE key = 'extractor_version'").fetchone()
+  return row[0] if row else None
 
 
 def initialize_index(db):
@@ -109,11 +112,11 @@ def vendor_of(path):
   return "cc", ROOT
 
 
-def iter_files(vendors):
+def iter_files(vendors, onerror=None):
   for vendor, root in ROOTS:
     if vendor not in vendors or not os.path.isdir(root):
       continue
-    for dirpath, dirs, names in os.walk(root):
+    for dirpath, dirs, names in os.walk(root, onerror=onerror):
       # Prune mirrored Codex rollouts under <cc_root>/codex so they are not indexed twice.
       if vendor == "cc" and dirpath == root and "codex" in dirs:
         dirs.remove("codex")
@@ -122,10 +125,16 @@ def iter_files(vendors):
           yield vendor, os.path.join(dirpath, n)
 
 
-def read_jsonl_records(path, start_offset=0):
+def read_jsonl_records(path, start_offset=0, indexed_identity=None):
   records = []
-  with open(path, "rb") as f:
+  # A replacement FIFO must not stall search before fstat can reject it.
+  opener = (lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) if indexed_identity else None
+  with open(path, "rb", opener=opener) as f:
     st = os.fstat(f.fileno())
+    if indexed_identity is not None:
+      indexed_size, indexed_inode = indexed_identity
+      if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
+        return st, 0, records
     if start_offset > 0:
       f.seek(start_offset)
     consumed = start_offset
@@ -416,6 +425,11 @@ def extract_rows(path, vendor=None, records=None):
   return rows
 
 
+# Keep the preceding extractor available when introducing a new version so searches
+# use the same ordinal mapping until the rebuilt database replaces the old one.
+EXTRACTORS = {1: extract_rows}
+
+
 def delete_file_messages(db, path_id):
   db.execute("DELETE FROM messages WHERE rowid IN (SELECT mid FROM message_refs WHERE path_id = ?)", (path_id,))
   db.execute("DELETE FROM message_refs WHERE path_id = ?", (path_id,))
@@ -449,10 +463,19 @@ def update_index(db, vendors):
   unseen = set(known)
   next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
   scanned = updated = failed = 0
-  for vendor, path in iter_files(vendors):
+
+  def record_read_error(exc):
+    nonlocal failed
+    failed += 1
+    print(f"skip unreadable source: {exc}", file=sys.stderr)
+
+  for vendor, path in iter_files(vendors, onerror=record_read_error):
     try:
       st_pre = os.stat(path)
-    except OSError:
+    except FileNotFoundError:
+      continue
+    except OSError as exc:
+      record_read_error(exc)
       continue
     unseen.discard(path)
     scanned += 1
@@ -471,13 +494,12 @@ def update_index(db, vendors):
       if can_append and (st.st_ino != prev[3] or st.st_size <= prev[1]):
         can_append = False
         st, new_offset, records = read_jsonl_records(path)
-      rows = extract_rows(path, vendor, records=records)
+      rows = EXTRACTORS[EXTRACTOR_VERSION](path, vendor, records=records)
     except OSError as exc:
-      failed += 1
-      print(f"skip unreadable file: {path}: {exc}", file=sys.stderr)
+      record_read_error(exc)
       continue
     if prev is None:
-      path_id = db.execute("INSERT INTO paths (path) VALUES (?)", (path,)).lastrowid
+      path_id = db.execute("INSERT INTO paths (path, vendor) VALUES (?, ?)", (path, vendor)).lastrowid
     else:
       path_id = prev[5]
       if not can_append:
@@ -506,7 +528,26 @@ def update_index(db, vendors):
   return scanned, updated, failed, total
 
 
-def rebuild_index(vendors, replacing):
+def indexed_roots(db, version):
+  if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'files'").fetchone():
+    return []
+  table = "paths" if version == SCHEMA_VERSION else "files"
+  required = []
+  for _, root in ROOTS:
+    prefix = root + os.sep
+    if db.execute(f"SELECT 1 FROM {table} WHERE substr(path, 1, ?) = ? LIMIT 1", (len(prefix), prefix)).fetchone():
+      required.append(root)
+  return required
+
+
+def require_roots_for_rebuild(roots):
+  missing = [root for root in roots if not os.path.isdir(root)]
+  if missing:
+    sys.exit(f"ccsi: kept the existing index; rebuild source unavailable: {', '.join(missing)}")
+
+
+def rebuild_index(vendors, replacing, required_roots):
+  require_roots_for_rebuild(required_roots)
   staging = DB_PATH.with_suffix(".sqlite.rebuild")
   staging.with_name(staging.name + "-journal").unlink(missing_ok=True)
   staging.unlink(missing_ok=True)
@@ -517,6 +558,7 @@ def rebuild_index(vendors, replacing):
       counts = update_index(db, vendors)
     if replacing and counts[2]:
       sys.exit("ccsi: rebuild could not read all discovered sessions; kept the existing index")
+    require_roots_for_rebuild(required_roots)
     os.replace(staging, DB_PATH)
     return counts
   finally:
@@ -534,18 +576,21 @@ def cmd_index(args):
     fcntl.flock(lock_file, fcntl.LOCK_EX)
     existing = DB_PATH.is_file()
     counts = None
+    required_roots = []
     if existing:
       set_private_mode(DB_PATH, 0o600)
       with closing(sqlite3.connect(DB_PATH)) as db:
         version = schema_version(db)
         if version > SCHEMA_VERSION:
           sys.exit("ccsi: the index was built by a newer ccsi version")
-        if version == SCHEMA_VERSION and current_extractor(db):
+        if version == SCHEMA_VERSION and indexed_extractor_version(db) == EXTRACTOR_VERSION:
           counts = update_index(db, vendors)
-      if counts is None and args.vendor:
-        sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+        elif args.vendor:
+          sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+        else:
+          required_roots = indexed_roots(db, version)
     if counts is None:
-      counts = rebuild_index(vendors, existing)
+      counts = rebuild_index(vendors, existing, required_roots)
     scanned, updated, failed, total = counts
     print(f"scanned={scanned} updated={updated} failed={failed} rows={total} took={time.time()-t0:.1f}s")
 
@@ -684,14 +729,12 @@ def short_match(text, tokens):
   return all(token.translate(SQLITE_LIKE_FOLD) in folded for token in tokens)
 
 
-def read_hit_rows(path, indexed_size, indexed_inode):
+def read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode):
   try:
-    st, _, records = read_jsonl_records(path)
+    _, _, records = read_jsonl_records(path, indexed_identity=(indexed_size, indexed_inode))
   except OSError:
     return []
-  if st.st_ino != indexed_inode or st.st_size < indexed_size:
-    return []
-  return extract_rows(path, records=records)
+  return extractor(path, vendor, records=records)
 
 
 def snippet_for(temp, query, text):
@@ -704,11 +747,11 @@ def snippet_for(temp, query, text):
   return result[0] if result else None
 
 
-def search_contentless(db, args, fts_query, short_tokens):
+def search_contentless(db, extractor, args, fts_query, short_tokens):
   if args.k == 0:
     return 0
   sql = (
-    "SELECT paths.path, ordinal, ts, role, files.size, files.ino "
+    "SELECT paths.path, paths.vendor, ordinal, ts, role, files.size, files.ino "
     "FROM messages JOIN message_refs ON mid = messages.rowid "
     "JOIN paths USING (path_id) JOIN files USING (path_id) "
     "WHERE messages MATCH ?"
@@ -719,13 +762,15 @@ def search_contentless(db, args, fts_query, short_tokens):
   found = 0
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
-    for path, ordinal, ts, role, indexed_size, indexed_inode in hits:
+    for path, vendor, ordinal, ts, role, indexed_size, indexed_inode in hits:
       if path not in by_path:
-        by_path[path] = read_hit_rows(path, indexed_size, indexed_inode)
+        by_path[path] = read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode)
       rows = by_path[path]
       if ordinal >= len(rows):
         continue
-      text = rows[ordinal][0]
+      text, _, source_ts, source_role = rows[ordinal]
+      if (ts, role) != (source_ts, source_role):
+        continue
       if not short_match(text, short_tokens):
         continue
       snippet = snippet_for(temp, fts_query, text)
@@ -761,10 +806,11 @@ def cmd_search(args):
     version = schema_version(db)
     if version < SCHEMA_VERSION:
       found = search_legacy(db, args, fts_query, short_tokens)
-    elif version == SCHEMA_VERSION and current_extractor(db):
-      found = search_contentless(db, args, fts_query, short_tokens)
     else:
-      sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
+      extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
+      if extractor is None:
+        sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
+      found = search_contentless(db, extractor, args, fts_query, short_tokens)
   if not found:
     print("(no hits)")
 
