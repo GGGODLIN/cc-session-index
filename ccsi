@@ -421,6 +421,24 @@ def delete_file_messages(db, path_id):
   db.execute("DELETE FROM message_refs WHERE path_id = ?", (path_id,))
 
 
+def prune_deleted_files(db, vendors, known, unseen):
+  roots = [root for vendor, root in ROOTS if vendor in vendors]
+  for path in unseen:
+    matching_roots = [root for root in roots if path.startswith(root + os.sep)]
+    if not matching_roots:
+      continue
+    try:
+      os.stat(path)
+    except FileNotFoundError:
+      if any(os.path.isdir(root) for root in matching_roots):
+        path_id = known[path][5]
+        delete_file_messages(db, path_id)
+        db.execute("DELETE FROM files WHERE path_id = ?", (path_id,))
+        db.execute("DELETE FROM paths WHERE path_id = ?", (path_id,))
+    except OSError:
+      continue
+
+
 def update_index(db, vendors):
   known = {
     path: (mtime, size, offset, ino, rows, path_id)
@@ -428,6 +446,7 @@ def update_index(db, vendors):
       "SELECT path, mtime, size, offset, ino, rows, path_id FROM files JOIN paths USING (path_id)"
     )
   }
+  unseen = set(known)
   next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
   scanned = updated = failed = 0
   for vendor, path in iter_files(vendors):
@@ -435,6 +454,7 @@ def update_index(db, vendors):
       st_pre = os.stat(path)
     except OSError:
       continue
+    unseen.discard(path)
     scanned += 1
     prev = known.get(path)
     if prev is not None and prev[0] == st_pre.st_mtime and prev[1] == st_pre.st_size and prev[3] == st_pre.st_ino:
@@ -480,6 +500,7 @@ def update_index(db, vendors):
     updated += 1
     if updated % 500 == 0:
       db.commit()
+  prune_deleted_files(db, vendors, known, unseen)
   db.commit()
   total = db.execute("SELECT coalesce(sum(rows), 0) FROM files").fetchone()[0]
   return scanned, updated, failed, total

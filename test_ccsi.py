@@ -203,6 +203,66 @@ class ChangedSearchSourceTest(unittest.TestCase):
       self.assertEqual(exhausted.count("--- [cc]"), 2)
 
 
+class PruneDeletedSessionsTest(unittest.TestCase):
+  def test_deleted_session_is_removed_from_index(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      path = cc_session(home, "deleted", "deletedneedle")
+      cc_session(home, "retained", "retainedneedle")
+      self.assertIn("rows=2 ", run_ccsi(home, "index").stdout)
+      self.assertIn(path.name, run_ccsi(home, "search", "deletedneedle").stdout)
+      path.unlink()
+      self.assertIn("rows=1 ", run_ccsi(home, "index").stdout)
+      self.assertEqual(run_ccsi(home, "search", "deletedneedle").stdout, "(no hits)\n")
+      self.assertIn("retained.jsonl", run_ccsi(home, "search", "retainedneedle").stdout)
+
+  def test_vendor_scoped_prune_retains_other_vendors(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc = cc_session(home, "deleted", "deletedneedle")
+      codex = home / ".codex/sessions/probe/rollout.jsonl"
+      write_codex_rollout(codex)
+      pi = home / ".pi/agent/sessions/probe/pi.jsonl"
+      pi.parent.mkdir(parents=True)
+      pi.write_text(json.dumps({"type": "message", "message": {"role": "user", "content": "pineedle"}}) + "\n")
+      initial = run_ccsi(home, "index").stdout
+      total = int(initial.split("rows=")[1].split()[0])
+      self.assertIn("rollout.jsonl", run_ccsi(home, "search", "codexneedle").stdout)
+      self.assertIn("pi.jsonl", run_ccsi(home, "search", "pineedle").stdout)
+      for path in (cc, codex, pi):
+        path.rename(path.with_suffix(".backup"))
+      self.assertIn(f"rows={total - 1} ", run_ccsi(home, "index", "--vendor", "cc").stdout)
+      for path in (codex, pi):
+        path.with_suffix(".backup").rename(path)
+      self.assertIn("rollout.jsonl", run_ccsi(home, "search", "codexneedle").stdout)
+      self.assertIn("pi.jsonl", run_ccsi(home, "search", "pineedle").stdout)
+      self.assertEqual(run_ccsi(home, "search", "deletedneedle").stdout, "(no hits)\n")
+
+  def test_missing_root_and_unreadable_file_preserve_index_entries(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      path = cc_session(home, "restore", "restoreneedle")
+      self.assertIn("rows=1 ", run_ccsi(home, "index").stdout)
+      initial = run_ccsi(home, "search", "restoreneedle").stdout
+      self.assertIn(path.name, initial)
+      root = home / ".claude/projects"
+      relocated = root.rename(root.with_name("projects-away"))
+      try:
+        self.assertIn("rows=1 ", run_ccsi(home, "index").stdout)
+      finally:
+        relocated.rename(root)
+      self.assertEqual(run_ccsi(home, "search", "restoreneedle").stdout, initial)
+      when = path.stat().st_mtime + 5
+      os.utime(path, (when, when))
+      path.chmod(0)
+      try:
+        report = run_ccsi(home, "index")
+        self.assertIn("failed=1 rows=1 ", report.stdout)
+      finally:
+        path.chmod(0o600)
+      self.assertEqual(run_ccsi(home, "search", "restoreneedle").stdout, initial)
+
+
 class IndexSafetyTest(unittest.TestCase):
   def test_read_failure_preserves_existing_index_and_metadata(self):
     with tempfile.TemporaryDirectory() as tmp:
