@@ -21,15 +21,29 @@ def default_db_dir():
   return os.path.join(cache_home, "cc-session-index")
 
 
+def follow_root_link(path):
+  if not os.path.islink(path):
+    return path
+  target = os.readlink(path)
+  return os.path.normpath(target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target))
+
+
 def build_roots():
   cc_cfg = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
   codex_home = os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex")
   pi_dir = os.path.expanduser(os.environ.get("PI_CODING_AGENT_DIR") or "~/.pi/agent")
-  return (
-    ("cc", os.path.join(cc_cfg, "projects")),
-    ("codex", os.path.join(codex_home, "sessions")),
-    ("codex", os.path.join(codex_home, "archived_sessions")),
-    ("pi", os.path.join(pi_dir, "sessions")),
+  # Account config dirs link their projects/ to one shared directory; following that last link keeps
+  # one path per transcript, otherwise each CLAUDE_CONFIG_DIR adds a copy that prune never removes.
+  # Only the root's own link is followed: a full realpath would also rewrite /var to /private/var
+  # and stop matching paths stored by earlier versions.
+  return tuple(
+    (vendor, follow_root_link(path))
+    for vendor, path in (
+      ("cc", os.path.join(cc_cfg, "projects")),
+      ("codex", os.path.join(codex_home, "sessions")),
+      ("codex", os.path.join(codex_home, "archived_sessions")),
+      ("pi", os.path.join(pi_dir, "sessions")),
+    )
   )
 
 

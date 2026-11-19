@@ -786,6 +786,28 @@ class ObeliskEnhancementsTest(unittest.TestCase):
       out = run_ccsi(home, "search", "customenvneedle", extra_env=extra).stdout
       self.assertIn("envtest.jsonl", out)
 
+  def test_symlinked_config_dirs_share_one_copy_of_each_transcript(self):
+    # Several account config dirs link their projects/ to the same transcripts; indexing from each
+    # used to store every file once per config dir.
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      real = home / ".claude"
+      s = real / "projects/probe/shared.jsonl"
+      s.parent.mkdir(parents=True)
+      s.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-11-19T07:00:00Z", "message": {"role": "user", "content": "symlinkneedle"}}) + "\n"
+      )
+      team = home / ".claude-team"
+      team.mkdir()
+      (team / "projects").symlink_to(real / "projects")
+      first = run_ccsi(home, "index").stdout
+      second = run_ccsi(home, "index", extra_env={"CLAUDE_CONFIG_DIR": str(team)}).stdout
+      self.assertIn("rows=1", first)
+      self.assertIn("updated=0", second)
+      self.assertIn("rows=1", second)
+      out = run_ccsi(home, "search", "symlinkneedle", extra_env={"CLAUDE_CONFIG_DIR": str(team)}).stdout
+      self.assertEqual(out.count("--- [cc]"), 1)
+
 
 if __name__ == "__main__":
   unittest.main()
