@@ -908,24 +908,33 @@ def parse_single_line_rows(path, vendor, raw):
 def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, before_rows, after_rows, need_before, need_after):
   collected_before = list(before_rows)
   cur = line_start
-  tail = b""
+  tail_chunks = []
   while len(collected_before) < need_before and cur > 0:
     step = max(0, cur - 65536)
     read_bytes = pread_exact(fd, cur - step, step)
     if read_bytes is None:
       return None, None
-    chunk = read_bytes + tail
     if step > 0:
-      nl = chunk.find(b"\n")
+      nl = read_bytes.find(b"\n")
       if nl == -1:
-        tail = chunk
+        tail_chunks.append(read_bytes)
         cur = step
         continue
-      tail = chunk[:nl + 1]
-      complete = chunk[nl + 1:]
+      if tail_chunks:
+        tail_chunks.append(read_bytes[nl + 1:])
+        tail_chunks.reverse()
+        complete = b"".join(tail_chunks)
+      else:
+        complete = read_bytes[nl + 1:]
+      tail_chunks = [read_bytes[:nl + 1]]
     else:
-      tail = b""
-      complete = chunk
+      if tail_chunks:
+        tail_chunks.append(read_bytes)
+        tail_chunks.reverse()
+        complete = b"".join(tail_chunks)
+        tail_chunks = []
+      else:
+        complete = read_bytes
     for raw in reversed(complete.split(b"\n")):
       if not raw:
         continue
@@ -939,23 +948,31 @@ def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, be
 
   collected_after = list(after_rows)
   cur = line_end
-  head = b""
+  head_chunks = []
   while len(collected_after) < need_after and cur < size:
     read_bytes = os.pread(fd, min(65536, size - cur), cur)
     if not read_bytes:
       break
     cur += len(read_bytes)
-    chunk = head + read_bytes
     if cur < size:
-      nl = chunk.rfind(b"\n")
+      nl = read_bytes.rfind(b"\n")
       if nl == -1:
-        head = chunk
+        head_chunks.append(read_bytes)
         continue
-      complete = chunk[:nl + 1]
-      head = chunk[nl + 1:]
+      if head_chunks:
+        head_chunks.append(read_bytes[:nl + 1])
+        complete = b"".join(head_chunks)
+      else:
+        complete = read_bytes[:nl + 1]
+      rem = read_bytes[nl + 1:]
+      head_chunks = [rem] if rem else []
     else:
-      complete = chunk
-      head = b""
+      if head_chunks:
+        head_chunks.append(read_bytes)
+        complete = b"".join(head_chunks)
+        head_chunks = []
+      else:
+        complete = read_bytes
     for raw in complete.split(b"\n"):
       if not raw:
         continue
@@ -968,7 +985,7 @@ def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, be
   return collected_before, collected_after
 
 
-def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, indexed_mtime, indexed_size, indexed_inode, context_count):
+def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, indexed_mtime, indexed_size, indexed_inode, context_count, full_prefiltered=None):
   # Returns ("invalid", None) if source failed identity/open check,
   # ("reject", None) if proven unable to match short_tokens,
   # ("direct", (text, before_rows, after_rows)) if unique (ts, role) in an unchanged file
@@ -1040,6 +1057,10 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
           return "full", None
     if not short_tokens:
       return "full", None
+    if full_prefiltered is not None and path in full_prefiltered:
+      return "full", None
+    if full_prefiltered is not None:
+      full_prefiltered.add(path)
     try:
       buf = pread_exact(fd, st.st_size, 0) if st.st_size > 0 else b""
     except OSError:
@@ -1065,9 +1086,11 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
   matching_texts = [text for text, _, source_ts, source_role in rows if (ts, role) == (source_ts, source_role)]
   if any(short_match(text, short_tokens) for text in matching_texts):
     return "full", None
-  if expected_tr_count is not None and len(matching_texts) == expected_tr_count:
-    return "reject", None
-  if b"\\u" in buf:
+  if expected_tr_count is not None:
+    if len(matching_texts) == expected_tr_count:
+      return "reject", None
+    return "full", None
+  if not matching_texts or b"\\u" in buf:
     return "full", None
   return "reject", None
 
@@ -1125,15 +1148,16 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
     return 0
   hits, fts_query = query_contentless_hits(db, args, fts_query)
   by_path = {}
+  full_prefiltered = set()
   dup_cache = {}
   found = 0
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
     for path_id, path, vendor, ordinal, ts, role, indexed_mtime, indexed_size, indexed_inode in hits:
-      if path not in by_path and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
+      if path not in by_path and path not in full_prefiltered and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
         status, payload = resolve_or_prefilter_hit(
           db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens,
-          indexed_mtime, indexed_size, indexed_inode, args.context,
+          indexed_mtime, indexed_size, indexed_inode, args.context, full_prefiltered,
         )
         if status == "invalid":
           by_path[path] = []

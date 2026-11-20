@@ -1,3 +1,5 @@
+import argparse
+import io
 import json
 import os
 import sqlite3
@@ -6,8 +8,11 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
+from importlib.machinery import SourceFileLoader
+import importlib.util
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("ccsi")
 
@@ -807,6 +812,225 @@ class ObeliskEnhancementsTest(unittest.TestCase):
       self.assertIn("rows=1", second)
       out = run_ccsi(home, "search", "symlinkneedle", extra_env={"CLAUDE_CONFIG_DIR": str(team)}).stdout
       self.assertEqual(out.count("--- [cc]"), 1)
+
+
+def load_ccsi_module():
+  loader = SourceFileLoader("ccsi_module", str(SCRIPT))
+  spec = importlib.util.spec_from_loader(loader.name, loader)
+  module = importlib.util.module_from_spec(spec)
+  loader.exec_module(module)
+  return module
+
+
+def compact_cc_line(ts, content, role="user"):
+  return json.dumps(
+    {"type": role, "timestamp": ts, "message": {"role": role, "content": content}},
+    separators=(",", ":"),
+  ) + "\n"
+
+
+class LargeFilePrefilterTest(unittest.TestCase):
+  def test_compact_json_large_file_uses_binary_seek_and_matches_legacy(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/compact-large.jsonl"
+      session.parent.mkdir(parents=True)
+      padding = "p" * 350
+      lines = []
+      for i in range(120):
+        ts = f"2026-11-20T00:{i // 60:02d}:{i % 60:02d}Z"
+        if i == 55:
+          content = f"compactneedle wrong only {padding}"
+        elif i == 58:
+          content = f"ctx before two {padding}"
+        elif i == 59:
+          content = f"ctx before one {padding}"
+        elif i == 60:
+          content = f"compactneedle zx target {padding}"
+        elif i == 61:
+          content = f"ctx after one {padding}"
+        elif i == 62:
+          content = f"ctx after two {padding}"
+        else:
+          content = f"filler row {i} {padding}"
+        lines.append(compact_cc_line(ts, content))
+      session.write_text("".join(lines))
+      self.assertGreater(session.stat().st_size, 32768)
+
+      ccsi_mod = load_ccsi_module()
+      fd = os.open(session, os.O_RDONLY)
+      try:
+        spans = ccsi_mod.seek_ts_spans_pread(fd, session.stat().st_size, b"2026-11-20T00:01:00Z")
+      finally:
+        os.close(fd)
+      self.assertIsNotNone(spans)
+      self.assertEqual(len(spans), 1)
+      self.assertIn(b"compactneedle zx target", spans[0][2])
+
+      old_env = {"CCSI_DB_DIR": str(home / "legacy")}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+
+      legacy_out = run_ccsi(home, "search", "compactneedle", "zx", "-C", "2", script=LEGACY_SCRIPT, extra_env=old_env).stdout
+      new_out = run_ccsi(home, "search", "compactneedle", "zx", "-C", "2").stdout
+      self.assertEqual(new_out, legacy_out)
+      self.assertEqual(new_out.count("--- [cc]"), 1)
+      self.assertIn("  - [user 2026-11-20T00:00:58Z] ctx before two", new_out)
+      self.assertIn("  - [user 2026-11-20T00:00:59Z] ctx before one", new_out)
+      self.assertIn("  > [user 2026-11-20T00:01:00Z] compactneedle zx target", new_out)
+      self.assertIn("  + [user 2026-11-20T00:01:01Z] ctx after one", new_out)
+      self.assertIn("  + [user 2026-11-20T00:01:02Z] ctx after two", new_out)
+
+  def test_scientific_notation_timestamp_in_large_file_does_not_false_reject(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/sci-ts.jsonl"
+      session.parent.mkdir(parents=True)
+      padding = "s" * 400
+      lines = [
+        compact_cc_line(f"2026-11-20T00:{i // 60:02d}:{i % 60:02d}Z", f"filler {i} {padding}")
+        for i in range(90)
+      ]
+      lines.insert(40, f'{{"type":"user","timestamp":1e12,"message":{{"role":"user","content":"scinotationneedle zx matched {padding}"}}}}\n')
+      lines.insert(45, f'{{"type":"user","timestamp":2e12,"message":{{"role":"user","content":"scinotationneedle unmatched {padding}"}}}}\n')
+      session.write_text("".join(lines))
+      self.assertGreater(session.stat().st_size, 32768)
+
+      run_ccsi(home, "index")
+      long_hits = run_ccsi(home, "search", "scinotationneedle").stdout
+      self.assertEqual(long_hits.count("--- [cc]"), 2)
+
+      short_hits = run_ccsi(home, "search", "scinotationneedle", "zx").stdout
+      self.assertEqual(short_hits.count("--- [cc]"), 1)
+      self.assertIn("1000000000000.0", short_hits)
+      self.assertIn(">>>scinotationneedle<<<", short_hits)
+
+      with session.open("a") as f:
+        f.write(compact_cc_line("2026-11-20T01:00:00Z", "appended active tail"))
+      self.assertEqual(run_ccsi(home, "search", "scinotationneedle", "zx").stdout, short_hits)
+
+  def test_unicode_escape_and_clock_rollback_in_large_file_fallback(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/rollback-escape.jsonl"
+      session.parent.mkdir(parents=True)
+      padding = "u" * 400
+      lines = [
+        compact_cc_line(f"2026-11-20T01:{i // 60:02d}:{i % 60:02d}Z", f"before {i} {padding}")
+        for i in range(60)
+      ]
+      lines.append(compact_cc_line("2026-11-20T00:04:59Z", f"rollback ctx prev {padding}"))
+      lines.append(compact_cc_line("2026-11-20T00:05:00Z", f"rollbackneedle zx hit {padding}"))
+      lines.append(compact_cc_line("2026-11-20T00:05:01Z", f"rollback ctx next {padding}"))
+      lines.append(
+        f'{{"type":"user","timestamp":"2026-11-20T00:06:00\\u005a","message":{{"role":"user","content":"escapeneedle \\u007a\\u0078 hit {padding}"}}}}\n'
+      )
+      for i in range(60):
+        lines.append(compact_cc_line(f"2026-11-20T02:{i // 60:02d}:{i % 60:02d}Z", f"after {i} {padding}"))
+      session.write_text("".join(lines))
+      self.assertGreater(session.stat().st_size, 32768)
+
+      old_env = {"CCSI_DB_DIR": str(home / "legacy")}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+
+      for args in (("rollbackneedle", "zx", "-C", "1"), ("escapeneedle", "zx")):
+        legacy_out = run_ccsi(home, "search", *args, script=LEGACY_SCRIPT, extra_env=old_env).stdout
+        new_out = run_ccsi(home, "search", *args).stdout
+        self.assertEqual(new_out, legacy_out)
+        self.assertEqual(new_out.count("--- [cc]"), 1)
+
+  def test_local_context_window_across_multichunk_lines(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/multichunk-ctx.jsonl"
+      session.parent.mkdir(parents=True)
+      huge_before = "B" * 200_000 + " before-one-tail"
+      huge_after = "A" * 200_000 + " after-one-tail"
+      lines = [
+        compact_cc_line("2026-11-20T00:00:01Z", "before-two-marker"),
+        compact_cc_line("2026-11-20T00:00:02Z", huge_before),
+        compact_cc_line("2026-11-20T00:00:03Z", "bigctxneedle zx center"),
+        compact_cc_line("2026-11-20T00:00:04Z", huge_after),
+        compact_cc_line("2026-11-20T00:00:05Z", "after-two-marker"),
+      ]
+      session.write_text("".join(lines))
+
+      old_env = {"CCSI_DB_DIR": str(home / "legacy")}
+      run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)
+      run_ccsi(home, "index")
+
+      legacy_out = run_ccsi(home, "search", "bigctxneedle", "zx", "-C", "2", script=LEGACY_SCRIPT, extra_env=old_env).stdout
+      new_out = run_ccsi(home, "search", "bigctxneedle", "zx", "-C", "2").stdout
+      self.assertEqual(new_out, legacy_out)
+      self.assertIn("  - [user 2026-11-20T00:00:01Z] before-two-marker\n", new_out)
+      self.assertIn("  - [user 2026-11-20T00:00:02Z] BBBBB", new_out)
+      self.assertIn("  > [user 2026-11-20T00:00:03Z] bigctxneedle zx center\n", new_out)
+      self.assertIn("  + [user 2026-11-20T00:00:04Z] AAAAA", new_out)
+      self.assertIn("  + [user 2026-11-20T00:00:05Z] after-two-marker\n", new_out)
+
+      ccsi_mod = load_ccsi_module()
+      fd = os.open(session, os.O_RDONLY)
+      try:
+        size = session.stat().st_size
+        spans = ccsi_mod.seek_ts_spans_pread(fd, size, b"2026-11-20T00:00:03Z")
+        self.assertIsNotNone(spans)
+        ls, le, _ = spans[0]
+        cb, ca = ccsi_mod.collect_local_context_pread(fd, size, str(session), "cc", ls, le, (), (), 2, 2)
+      finally:
+        os.close(fd)
+      self.assertEqual([r[0] for r in cb], ["before-two-marker", huge_before[:8000]])
+      self.assertEqual([r[0] for r in ca], [huge_after[:8000], "after-two-marker"])
+
+  def test_growing_large_file_avoids_repeated_full_pread_across_candidates(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/growing-large.jsonl"
+      session.parent.mkdir(parents=True)
+      padding = "g" * 1800
+      lines = [
+        compact_cc_line(
+          f"2026-11-20T00:00:{i:02d}Z",
+          f"activedupneedle activedupneedle activedupneedle filler {i} {padding}",
+        )
+        for i in range(20)
+      ]
+      lines.append(compact_cc_line("2026-11-20T00:00:50Z", f"activedupneedle zx winner {padding}"))
+      session.write_text("".join(lines))
+      self.assertGreater(session.stat().st_size, 32768)
+
+      run_ccsi(home, "index")
+      with session.open("a") as f:
+        f.write(compact_cc_line("2026-11-20T00:01:00Z", "live appended line"))
+
+      cli_out = run_ccsi(home, "search", "activedupneedle", "zx").stdout
+      self.assertEqual(cli_out.count("--- [cc]"), 1)
+      self.assertIn("2026-11-20T00:00:50Z", cli_out)
+
+      ccsi_mod = load_ccsi_module()
+      db_path = db_path_for(home)
+      full_pread_calls = []
+      orig_pread_exact = ccsi_mod.pread_exact
+
+      def counting_pread_exact(fd, count, offset):
+        if offset == 0 and count >= 32768:
+          full_pread_calls.append(count)
+        return orig_pread_exact(fd, count, offset)
+
+      args = argparse.Namespace(k=10, vendor=None, exclude_session=[], context=0)
+      buf = io.StringIO()
+      with (
+        mock.patch.object(ccsi_mod, "ROOTS", (("cc", str(home / ".claude/projects")),)),
+        mock.patch.object(ccsi_mod, "ROOT", str(home / ".claude/projects")),
+        mock.patch.object(ccsi_mod, "pread_exact", side_effect=counting_pread_exact),
+        closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as db,
+        redirect_stdout(buf),
+      ):
+        found = ccsi_mod.search_contentless(db, ccsi_mod.extract_rows, args, "activedupneedle", ["zx"])
+
+      self.assertEqual(found, 1)
+      self.assertEqual(buf.getvalue(), cli_out)
+      self.assertLessEqual(len(full_pread_calls), 1)
 
 
 if __name__ == "__main__":
