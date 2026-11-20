@@ -891,14 +891,15 @@ class LargeFilePrefilterTest(unittest.TestCase):
         compact_cc_line(f"2026-11-20T00:{i // 60:02d}:{i % 60:02d}Z", f"filler {i} {padding}")
         for i in range(90)
       ]
-      lines.insert(40, f'{{"type":"user","timestamp":1e12,"message":{{"role":"user","content":"scinotationneedle zx matched {padding}"}}}}\n')
-      lines.insert(45, f'{{"type":"user","timestamp":2e12,"message":{{"role":"user","content":"scinotationneedle unmatched {padding}"}}}}\n')
+      lines.insert(40, f'{{"type":"user","timestamp":1000000000000.0,"message":{{"role":"user","content":"scinotationneedle canonical miss {padding}"}}}}\n')
+      lines.insert(41, f'{{"type":"user","timestamp":1e12,"message":{{"role":"user","content":"scinotationneedle zx matched {padding}"}}}}\n')
+      lines.insert(46, f'{{"type":"user","timestamp":2e12,"message":{{"role":"user","content":"scinotationneedle unmatched {padding}"}}}}\n')
       session.write_text("".join(lines))
       self.assertGreater(session.stat().st_size, 32768)
 
       run_ccsi(home, "index")
       long_hits = run_ccsi(home, "search", "scinotationneedle").stdout
-      self.assertEqual(long_hits.count("--- [cc]"), 2)
+      self.assertEqual(long_hits.count("--- [cc]"), 3)
 
       short_hits = run_ccsi(home, "search", "scinotationneedle", "zx").stdout
       self.assertEqual(short_hits.count("--- [cc]"), 1)
@@ -917,7 +918,7 @@ class LargeFilePrefilterTest(unittest.TestCase):
       padding = "u" * 400
       lines = [
         compact_cc_line(f"2026-11-20T01:{i // 60:02d}:{i % 60:02d}Z", f"before {i} {padding}")
-        for i in range(60)
+        for i in range(180)
       ]
       lines.append(compact_cc_line("2026-11-20T00:04:59Z", f"rollback ctx prev {padding}"))
       lines.append(compact_cc_line("2026-11-20T00:05:00Z", f"rollbackneedle zx hit {padding}"))
@@ -928,7 +929,14 @@ class LargeFilePrefilterTest(unittest.TestCase):
       for i in range(60):
         lines.append(compact_cc_line(f"2026-11-20T02:{i // 60:02d}:{i % 60:02d}Z", f"after {i} {padding}"))
       session.write_text("".join(lines))
-      self.assertGreater(session.stat().st_size, 32768)
+      self.assertGreater(session.stat().st_size, 96_000)
+
+      ccsi_mod = load_ccsi_module()
+      fd = os.open(session, os.O_RDONLY)
+      try:
+        self.assertIsNone(ccsi_mod.seek_ts_spans_pread(fd, session.stat().st_size, b"2026-11-20T00:05:00Z"))
+      finally:
+        os.close(fd)
 
       old_env = {"CCSI_DB_DIR": str(home / "legacy")}
       run_ccsi(home, "index", script=LEGACY_SCRIPT, extra_env=old_env)

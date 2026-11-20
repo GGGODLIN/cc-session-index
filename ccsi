@@ -740,6 +740,7 @@ def search_legacy(db, args, fts_query, short_tokens):
 
 SQLITE_LIKE_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 TS_RAW_RE = re.compile(r"\A[0-9A-Za-zT:.\-+_ ]+\Z")
+NUMERIC_TS_RE = re.compile(r"\A[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
 TS_KEY_BYTES = b'"timestamp":"'
 PREAD_CHUNK_MAX = 64 * 1024 * 1024
 
@@ -1090,7 +1091,7 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
     if len(matching_texts) == expected_tr_count:
       return "reject", None
     return "full", None
-  if not matching_texts or b"\\u" in buf:
+  if not matching_texts or b"\\u" in buf or NUMERIC_TS_RE.match(ts):
     return "full", None
   return "reject", None
 
@@ -1154,7 +1155,7 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
   with closing(sqlite3.connect(":memory:")) as temp:
     temp.execute("CREATE VIRTUAL TABLE excerpts USING fts5(text, tokenize='trigram')")
     for path_id, path, vendor, ordinal, ts, role, indexed_mtime, indexed_size, indexed_inode in hits:
-      if path not in by_path and path not in full_prefiltered and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
+      if path not in by_path and extractor is extract_rows and ts and TS_RAW_RE.match(ts):
         status, payload = resolve_or_prefilter_hit(
           db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens,
           indexed_mtime, indexed_size, indexed_inode, args.context, full_prefiltered,
