@@ -1040,6 +1040,77 @@ class LargeFilePrefilterTest(unittest.TestCase):
       self.assertEqual(buf.getvalue(), cli_out)
       self.assertLessEqual(len(full_pread_calls), 1)
 
+  def test_short_scan_2char_cjk_recency_context_and_escapes(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      older = home / ".claude/projects/probe/older-cjk.jsonl"
+      newer = home / ".claude/projects/probe/newer-cjk.jsonl"
+      escaped = home / ".claude/projects/probe/escaped-cjk.jsonl"
+      older.parent.mkdir(parents=True)
+      older.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-11-10T01:00:00Z", "message": {"role": "user", "content": "舊版記憶 衝突 紀錄"}}, ensure_ascii=False) + "\n"
+      )
+      newer.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-11-20T01:00:00Z", "message": {"role": "user", "content": "前文背景"}}, ensure_ascii=False) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-11-20T01:00:05Z", "message": {"role": "user", "content": "最新記憶與衝突的處理方式 V2"}}, ensure_ascii=False) + "\n"
+        + json.dumps({"type": "user", "timestamp": "2026-11-20T01:00:10Z", "message": {"role": "user", "content": "後續結語"}}, ensure_ascii=False) + "\n"
+      )
+      # Write escaped \uXXXX JSON so raw UTF-8 bytes are absent on disk
+      escaped.write_text(
+        json.dumps({"type": "user", "timestamp": "2026-11-15T01:00:00Z", "message": {"role": "user", "content": "記憶 衝突 逸出測試"}}, ensure_ascii=True) + "\n"
+      )
+      os.utime(older, (1700000100, 1700000100))
+      os.utime(escaped, (1700000200, 1700000200))
+      os.utime(newer, (1700000300, 1700000300))
+      run_ccsi(home, "index")
+
+      # Default without --short-scan keeps exit 2 contract
+      no_flag = run_ccsi(home, "search", "記憶", "衝突", check=False)
+      self.assertEqual(no_flag.returncode, 2)
+      self.assertIn("--short-scan", no_flag.stderr)
+
+      # With --short-scan: newest file hits first, highlights tokens, supports -C context
+      hit = run_ccsi(home, "search", "--short-scan", "-C", "1", "記憶", "衝突")
+      self.assertEqual(hit.stdout.count("--- [cc]"), 3)
+      lines = [l for l in hit.stdout.splitlines() if l.startswith("--- [cc]")]
+      self.assertIn("newer-cjk.jsonl", lines[0])
+      self.assertIn("escaped-cjk.jsonl", lines[1])
+      self.assertIn("older-cjk.jsonl", lines[2])
+      self.assertIn(">>>記憶<<<", hit.stdout)
+      self.assertIn(">>>衝突<<<", hit.stdout)
+      self.assertIn("  - [user 2026-11-20T01:00:00Z] 前文背景", hit.stdout)
+      self.assertIn("  + [user 2026-11-20T01:00:10Z] 後續結語", hit.stdout)
+
+      # Mixed ASCII case folding + CJK
+      mixed = run_ccsi(home, "search", "--short-scan", "記憶", "v2")
+      self.assertEqual(mixed.stdout.count("--- [cc]"), 1)
+      self.assertIn("newer-cjk.jsonl", mixed.stdout)
+
+      # Bounded --scan-limit respects newest files first
+      bounded = run_ccsi(home, "search", "--short-scan", "--scan-limit", "1", "記憶", "衝突")
+      self.assertEqual(bounded.stdout.count("--- [cc]"), 1)
+      self.assertIn("newer-cjk.jsonl", bounded.stdout)
+
+      # --exclude-session filters out excluded paths
+      excluded = run_ccsi(home, "search", "--short-scan", "--exclude-session", "newer-cjk", "記憶", "衝突")
+      self.assertNotIn("newer-cjk.jsonl", excluded.stdout)
+      self.assertEqual(excluded.stdout.count("--- [cc]"), 2)
+
+  def test_short_scan_rejects_boolean_syntax_single_char_and_negative_limit(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "s1", "白話 測試")
+      run_ccsi(home, "index")
+
+      bool_err = run_ccsi(home, "search", "--short-scan", "白話 AND 測試", check=False)
+      self.assertEqual(bool_err.returncode, 2)
+
+      single_char = run_ccsi(home, "search", "--short-scan", "a", check=False)
+      self.assertEqual(single_char.returncode, 2)
+
+      neg_limit = run_ccsi(home, "search", "--short-scan", "--scan-limit", "-1", "白話", check=False)
+      self.assertNotEqual(neg_limit.returncode, 0)
+
 
 if __name__ == "__main__":
   unittest.main()

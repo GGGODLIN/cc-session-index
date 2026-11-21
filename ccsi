@@ -1207,26 +1207,175 @@ def search_contentless(db, extractor, args, fts_query, short_tokens):
   return found
 
 
+def parse_short_scan_tokens(query):
+  if FTS_SYNTAX_RE.search(query):
+    return None
+  tokens = [t.strip() for t in query.split() if t.strip()]
+  if not tokens or not any(len(t) >= 2 for t in tokens):
+    return None
+  return tokens
+
+
+def short_snippet_for(text, tokens, radius=120):
+  folded = text.split("\0", 1)[0].translate(SQLITE_LIKE_FOLD)
+  hits = []
+  for token in tokens:
+    tf = token.translate(SQLITE_LIKE_FOLD)
+    idx = folded.find(tf)
+    if idx == -1:
+      return None
+    hits.append((idx, idx + len(token)))
+  hits.sort()
+  start = max(0, hits[0][0] - radius)
+  end = min(len(text), hits[0][1] + radius)
+  # Merge overlapping/adjacent highlight spans within [start, end]
+  spans = []
+  for a, b in hits:
+    if b <= start or a >= end:
+      continue
+    ca, cb = max(start, a), min(end, b)
+    if spans and ca <= spans[-1][1]:
+      spans[-1] = (spans[-1][0], max(spans[-1][1], cb))
+    else:
+      spans.append((ca, cb))
+  parts = []
+  cur = start
+  for a, b in spans:
+    if a > cur:
+      parts.append(text[cur:a])
+    parts.append(f">>>{text[a:b]}<<<")
+    cur = b
+  if cur < end:
+    parts.append(text[cur:end])
+  prefix = "…" if start > 0 else ""
+  suffix = "…" if end < len(text) else ""
+  return prefix + "".join(parts) + suffix
+
+
+def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list):
+  try:
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+  except OSError:
+    return False
+  try:
+    try:
+      st = os.fstat(fd)
+    except OSError:
+      return False
+    if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
+      return False
+    buf = pread_exact(fd, st.st_size, 0) if st.st_size > 0 else b""
+    if buf is None:
+      return False
+  finally:
+    os.close(fd)
+  # JSONL strings may encode characters as \uXXXX; fall back to full parse when present.
+  if b"\\u" in buf:
+    return True
+  # bytes.lower() only folds ASCII A-Z, leaving UTF-8 multibyte sequences intact.
+  low = buf.lower()
+  return all(tok in low for tok in token_bytes_list)
+
+
+def search_short_scan_legacy(db, args, short_tokens):
+  if args.k == 0:
+    return 0
+  filters, path_params = path_filters(args, "+path")
+  sql = "SELECT rowid, path, ts, role, text FROM messages WHERE 1=1"
+  sql += " AND +text LIKE ? ESCAPE '!'" * len(short_tokens)
+  sql += filters + " ORDER BY ts DESC LIMIT ?"
+  params = [*(escape_like(token) for token in short_tokens), *path_params, args.k]
+  hits = db.execute(sql, params).fetchall()
+  found = 0
+  for mid, path, ts, role, text in hits:
+    snip = short_snippet_for(text, short_tokens)
+    if snip is None:
+      continue
+    print_hit(path, ts, role, snip)
+    if args.context > 0:
+      for context_mid, context_ts, context_role, ctext in legacy_context(db, path, mid, args.context):
+        marker = "-" if context_mid < mid else "+" if context_mid > mid else ">"
+        print_context(marker, context_ts, context_role, ctext)
+    found += 1
+  return found
+
+
+def search_short_scan_contentless(db, extractor, args, short_tokens):
+  if args.k == 0:
+    return 0
+  filters, params = path_filters(args, "paths.path")
+  sql = (
+    "SELECT paths.path, paths.vendor, files.size, files.ino "
+    "FROM paths JOIN files USING (path_id) WHERE 1=1" + filters
+    + " ORDER BY files.mtime DESC"
+  )
+  if args.scan_limit < 0:
+    sys.exit("query error: --scan-limit must be >= 0")
+  if args.scan_limit > 0:
+    sql += " LIMIT ?"
+    params.append(args.scan_limit)
+  token_bytes_list = [
+    t.translate(SQLITE_LIKE_FOLD).encode("utf-8")
+    for t in short_tokens
+  ]
+  found = 0
+  for path, vendor, indexed_size, indexed_inode in db.execute(sql, params):
+    if not file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list):
+      continue
+    rows = read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode)
+    for ordinal in range(len(rows) - 1, -1, -1):
+      text, _, ts, role = rows[ordinal]
+      if not short_match(text, short_tokens):
+        continue
+      snip = short_snippet_for(text, short_tokens)
+      if snip is None:
+        continue
+      print_hit(path, ts, role, snip)
+      if args.context > 0:
+        for adjacent, _, cts, crole in rows[max(0, ordinal - args.context):ordinal]:
+          print_context("-", cts, crole, adjacent)
+        print_context(">", ts, role, text)
+        for adjacent, _, cts, crole in rows[ordinal + 1:ordinal + 1 + args.context]:
+          print_context("+", cts, crole, adjacent)
+      found += 1
+      if found == args.k:
+        return found
+  return found
+
+
 def cmd_search(args):
   query = " ".join(args.query)
   fts_query, short_tokens = parse_search_query(query)
+  short_scan_tokens = None
   if fts_query is None:
-    print(
-      f"query error: trigram index requires >=3-char terms (or plain space-separated mixed terms without boolean/quoted <3-char tokens; got: {query})",
-      file=sys.stderr,
-    )
-    sys.exit(2)
+    if args.short_scan:
+      short_scan_tokens = parse_short_scan_tokens(query)
+    if short_scan_tokens is None:
+      print(
+        f"query error: trigram index requires >=3-char terms (or plain space-separated mixed terms without boolean/quoted <3-char tokens; use --short-scan for 2-char CJK/short-term bounded scan; got: {query})",
+        file=sys.stderr,
+      )
+      sys.exit(2)
   if not DB_PATH.is_file():
-    with closing(sqlite3.connect(":memory:")) as db:
-      execute_fts_schema(db, "CREATE VIRTUAL TABLE messages USING fts5("
-                            "text, path UNINDEXED, ts UNINDEXED, role UNINDEXED, tokenize='trigram')")
-      search_legacy(db, args, fts_query, short_tokens)
+    if fts_query is not None:
+      with closing(sqlite3.connect(":memory:")) as db:
+        execute_fts_schema(db, "CREATE VIRTUAL TABLE messages USING fts5("
+                              "text, path UNINDEXED, ts UNINDEXED, role UNINDEXED, tokenize='trigram')")
+        search_legacy(db, args, fts_query, short_tokens)
     print("(no hits)")
     return
   with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as db:
     db.execute("BEGIN")
     version = schema_version(db)
-    if version < SCHEMA_VERSION:
+    if short_scan_tokens is not None:
+      if version < SCHEMA_VERSION:
+        found = search_short_scan_legacy(db, args, short_scan_tokens)
+      else:
+        extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
+        if extractor is None:
+          sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
+        found = search_short_scan_contentless(db, extractor, args, short_scan_tokens)
+    elif version < SCHEMA_VERSION:
       found = search_legacy(db, args, fts_query, short_tokens)
     else:
       extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
@@ -1276,6 +1425,8 @@ def main():
   p_search.add_argument("--vendor", action="append", choices=VENDORS, help="restrict hits to one vendor")
   p_search.add_argument("--exclude-session", action="append", default=[], help="exclude session paths containing this substring")
   p_search.add_argument("-C", "--context", type=int, default=0, help="show N surrounding indexed messages from the same file")
+  p_search.add_argument("--short-scan", action="store_true", help="fall back to bounded recency-ordered scan when all query terms are <3 chars (e.g., 2-char CJK)")
+  p_search.add_argument("--scan-limit", type=int, default=400, help="max most-recent indexed files to scan in --short-scan mode (0 = unlimited, default 400)")
   p_search.set_defaults(fn=cmd_search)
   p_events = sub.add_parser("events", help="stream normalized events as JSONL (vendor, session, ts, cwd, role, kind, tool, model, text)")
   p_events.add_argument("--vendor", action="append", choices=VENDORS)
