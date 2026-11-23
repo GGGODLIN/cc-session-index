@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 import argparse
+import errno
 import fcntl
 import json
+import math
 import os
 import re
 import sqlite3
 import stat
 import sys
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 def default_db_dir():
@@ -145,16 +147,28 @@ def iter_files(vendors, onerror=None):
           yield vendor, os.path.join(dirpath, n)
 
 
-def read_jsonl_records(path, start_offset=0, indexed_identity=None):
+def parse_json_object(text):
+  try:
+    obj = json.loads(text)
+  except (json.JSONDecodeError, RecursionError):
+    return None, False
+  return (obj if isinstance(obj, dict) else None), True
+
+
+def read_jsonl_records(path, start_offset=0, indexed_identity=None, append_validator=None, nonblock=False):
   records = []
-  # A replacement FIFO must not stall search before fstat can reject it.
-  opener = (lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) if indexed_identity else None
+  opener = (lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) if (indexed_identity is not None or nonblock) else None
   with open(path, "rb", opener=opener) as f:
     st = os.fstat(f.fileno())
     if indexed_identity is not None:
       indexed_size, indexed_inode = indexed_identity
       if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
         return st, 0, records
+    elif nonblock and not stat.S_ISREG(st.st_mode):
+      raise OSError(errno.EINVAL, "not a regular file", path)
+    if append_validator is not None and start_offset > 0:
+      if not append_validator(f.fileno(), st):
+        return st, None, None
     if start_offset > 0:
       f.seek(start_offset)
     consumed = start_offset
@@ -162,32 +176,26 @@ def read_jsonl_records(path, start_offset=0, indexed_identity=None):
       line_start = f.tell()
       raw = f.readline(st.st_size - line_start)
       if not raw:
+        st = os.fstat(f.fileno())
         break
       line_end = f.tell()
       text = raw.decode("utf-8", errors="replace")
+      obj, valid = parse_json_object(text)
       if raw.endswith(b"\n"):
         consumed = line_end
-        try:
-          obj = json.loads(text)
-        except json.JSONDecodeError:
-          continue
-        if isinstance(obj, dict):
+        if valid and obj is not None:
           records.append(obj)
       else:
-        try:
-          obj = json.loads(text)
-        except json.JSONDecodeError:
-          # Incomplete trailing line from a live writer: hold cursor at line_start
-          # so the next incremental pass reads the completed JSON object.
+        if not valid:
           break
         consumed = line_end
-        if isinstance(obj, dict):
+        if obj is not None:
           records.append(obj)
   return st, consumed, records
 
 
 def load_lines(path):
-  _, _, records = read_jsonl_records(path, 0)
+  _, _, records = read_jsonl_records(path, 0, nonblock=True)
   yield from records
 
 
@@ -473,6 +481,40 @@ def prune_deleted_files(db, vendors, known, unseen):
       continue
 
 
+def verify_append_boundary(fd, start_offset, size, path, vendor, expected_last):
+  if start_offset <= 0 or start_offset > size:
+    return False
+  prev_byte = pread_exact(fd, 1, start_offset - 1)
+  if prev_byte == b"\n":
+    line_end = start_offset - 1
+  elif prev_byte == b"}":
+    next_byte = pread_exact(fd, 1, start_offset) if start_offset < size else b""
+    if next_byte not in (b"\n", b"\r"):
+      return False
+    line_end = start_offset
+  else:
+    return False
+  win_start = max(0, line_end - 65536)
+  chunk = pread_exact(fd, line_end - win_start, win_start)
+  if chunk is None:
+    return False
+  lines = chunk.split(b"\n")
+  start_idx = 0 if win_start == 0 else 1
+  found_row = None
+  for raw in reversed(lines[start_idx:]):
+    if not raw:
+      continue
+    rows = parse_single_line_rows(path, vendor, raw)
+    if rows:
+      found_row = (rows[-1][2], rows[-1][3])
+      break
+  if found_row is not None:
+    return expected_last is not None and found_row == expected_last
+  if win_start == 0:
+    return expected_last is None
+  return False
+
+
 def update_index(db, vendors, indexed_paths=frozenset()):
   known = {
     path: (mtime, size, offset, ino, rows, path_id)
@@ -515,15 +557,43 @@ def update_index(db, vendors, indexed_paths=frozenset()):
       prev is not None
       and prev[3] == st_pre.st_ino
       and st_pre.st_size > prev[1]
+      and st_pre.st_mtime >= prev[0]
       and prev[2] > 0
     )
     start_offset = prev[2] if can_append else 0
+    validator = None
+    if can_append:
+      expected_last = None
+      if prev[4] > 0:
+        expected_last = db.execute(
+          "SELECT ts, role FROM message_refs WHERE path_id = ? AND ordinal = ?",
+          (prev[5], prev[4] - 1),
+        ).fetchone()
+      validator = lambda fd, st, p=prev, cur_path=path, cur_vendor=vendor, el=expected_last: (
+        st.st_ino == p[3]
+        and st.st_size > p[1]
+        and st.st_mtime >= p[0]
+        and verify_append_boundary(fd, p[2], st.st_size, cur_path, cur_vendor, el)
+      )
     try:
-      st, new_offset, records = read_jsonl_records(path, start_offset)
-      if can_append and (st.st_ino != prev[3] or st.st_size <= prev[1]):
+      st, new_offset, records = read_jsonl_records(path, start_offset, append_validator=validator)
+      if (
+        new_offset is None
+        or (can_append and (st.st_ino != prev[3] or st.st_size <= prev[1] or st.st_mtime < prev[0]))
+        or new_offset > st.st_size
+      ):
         can_append = False
         st, new_offset, records = read_jsonl_records(path)
+        if new_offset > st.st_size:
+          st, new_offset, records = read_jsonl_records(path)
+        if new_offset > st.st_size:
+          new_offset = st.st_size
       rows = EXTRACTORS[EXTRACTOR_VERSION](path, vendor, records=records)
+    except FileNotFoundError:
+      scanned -= 1
+      if prev is not None:
+        unseen.add(path)
+      continue
     except OSError as exc:
       record_read_error(exc, path)
       continue
@@ -561,6 +631,8 @@ def previously_indexed_paths(db, version):
   if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'files'").fetchone():
     return set()
   table = "paths" if version == SCHEMA_VERSION else "files"
+  if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = ?", (table,)).fetchone():
+    return set()
   return {path for (path,) in db.execute(f"SELECT path FROM {table}")}
 
 
@@ -570,49 +642,187 @@ def require_roots_for_rebuild(roots):
     sys.exit(f"ccsi: kept the existing index; rebuild source unavailable: {', '.join(missing)}")
 
 
+def sqlite_sidecars(db_path):
+  return (db_path.with_name(db_path.name + suffix) for suffix in ("-wal", "-shm", "-journal"))
+
+
+def remove_sqlite_sidecars(db_path):
+  for sidecar in sqlite_sidecars(db_path):
+    sidecar.unlink(missing_ok=True)
+
+
+def has_v3_tables(db):
+  tables = {row[0] for row in db.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")}
+  required = {"paths", "files", "message_refs", "metadata", "messages", "messages_data", "messages_idx", "messages_config"}
+  if not required.issubset(tables):
+    return False
+  db.execute("SELECT path_id, path, vendor FROM paths LIMIT 0")
+  db.execute("SELECT path_id, mtime, size, offset, ino, rows FROM files LIMIT 0")
+  db.execute("SELECT mid, path_id, ordinal, ts, role FROM message_refs LIMIT 0")
+  db.execute("SELECT key, value FROM metadata LIMIT 0")
+  db.execute("SELECT rowid FROM messages LIMIT 0")
+  return True
+
+
+def is_corruption_error(exc):
+  if isinstance(exc, sqlite3.IntegrityError):
+    return True
+  if isinstance(exc, sqlite3.OperationalError):
+    msg = str(exc).lower()
+    if "locked" in msg or "busy" in msg or "readonly" in msg:
+      return False
+    return any(
+      term in msg
+      for term in ("malformed", "not a database", "corrupt", "no such table", "no such column", "vtable", "sql logic error", "disk image")
+    )
+  return type(exc) is sqlite3.DatabaseError
+
+
+def parse_lock_timeout(raw_value):
+  raw = os.environ.get("CCSI_LOCK_TIMEOUT") if raw_value is None else raw_value
+  if raw is None or raw == "":
+    return 60.0
+  try:
+    value = float(raw)
+  except (TypeError, ValueError):
+    sys.exit(f"ccsi: invalid lock timeout: {raw}")
+  if not math.isfinite(value) or value < 0:
+    sys.exit(f"ccsi: lock timeout must be >= 0 (got: {raw})")
+  return value
+
+
+@contextmanager
+def acquire_index_lock(lock_path, timeout):
+  fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+  set_private_mode(lock_path, 0o600)
+  deadline = time.monotonic() + timeout
+  acquired = False
+  try:
+    while True:
+      try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = True
+        break
+      except OSError as exc:
+        if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+          raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          holder = ""
+          try:
+            raw = os.pread(fd, 64, 0).decode("ascii", errors="ignore").strip()
+            if raw:
+              holder = f" (held by pid {raw})"
+          except OSError:
+            pass
+          sys.exit(f"ccsi: timed out after {timeout:g}s waiting for index lock {lock_path}{holder}")
+        time.sleep(min(0.05, remaining))
+    try:
+      os.ftruncate(fd, 0)
+      os.lseek(fd, 0, os.SEEK_SET)
+      os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+    except OSError:
+      pass
+    yield fd
+  finally:
+    if acquired:
+      try:
+        os.ftruncate(fd, 0)
+      except OSError:
+        pass
+      try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+    os.close(fd)
+
+
+def ensure_index_can_be_replaced():
+  if DB_PATH.is_file():
+    with closing(sqlite3.connect(DB_PATH, timeout=0)) as db:
+      try:
+        mode = db.execute("PRAGMA journal_mode").fetchone()[0]
+      except sqlite3.DatabaseError as exc:
+        if not is_corruption_error(exc):
+          sys.exit(f"ccsi: kept the existing index; could not check its journal mode: {exc}")
+      else:
+        if mode == "wal":
+          # SQLite can leave WAL only after other users release the old database.
+          try:
+            mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+          except sqlite3.Error as exc:
+            sys.exit(f"ccsi: kept the existing WAL index; close other SQLite connections and retry: {exc}")
+          if mode != "delete":
+            sys.exit("ccsi: kept the existing WAL index; could not switch out of WAL mode")
+  # Leftover sidecars may still serve old connections or contain uncheckpointed data.
+  if any(os.path.lexists(sidecar) for sidecar in sqlite_sidecars(DB_PATH)):
+    sys.exit("ccsi: kept the existing index; SQLite sidecars remain, close other connections and retry")
+
+
 def rebuild_index(vendors, indexed_paths):
   required_roots = [root for vendor, root in ROOTS if vendor in vendors
                     and any(path.startswith(root + os.sep) for path in indexed_paths)]
   require_roots_for_rebuild(required_roots)
   staging = DB_PATH.with_suffix(".sqlite.rebuild")
-  staging.with_name(staging.name + "-journal").unlink(missing_ok=True)
+  remove_sqlite_sidecars(staging)
   staging.unlink(missing_ok=True)
   staging.touch(mode=0o600, exist_ok=False)
+  set_private_mode(staging, 0o600)
   try:
     with closing(sqlite3.connect(staging)) as db:
       initialize_index(db)
       counts = update_index(db, vendors, indexed_paths)
     require_roots_for_rebuild(required_roots)
+    ensure_index_can_be_replaced()
     os.replace(staging, DB_PATH)
     return counts
   finally:
     staging.unlink(missing_ok=True)
+    remove_sqlite_sidecars(staging)
 
 
 def cmd_index(args):
   t0 = time.time()
+  lock_timeout = parse_lock_timeout(getattr(args, "lock_timeout", None))
   os.makedirs(DB_DIR, mode=0o700, exist_ok=True)
   set_private_mode(DB_DIR, 0o700)
   lock_path = os.path.join(DB_DIR, "index.lock")
   vendors = set(args.vendor or VENDORS)
-  with open(lock_path, "w") as lock_file:
-    set_private_mode(lock_path, 0o600)
-    fcntl.flock(lock_file, fcntl.LOCK_EX)
+  with acquire_index_lock(lock_path, lock_timeout):
     existing = DB_PATH.is_file()
     counts = None
     indexed_paths = frozenset()
     if existing:
       set_private_mode(DB_PATH, 0o600)
-      with closing(sqlite3.connect(DB_PATH)) as db:
-        version = schema_version(db)
-        if version > SCHEMA_VERSION:
-          sys.exit("ccsi: the index was built by a newer ccsi version")
-        if version == SCHEMA_VERSION and indexed_extractor_version(db) == EXTRACTOR_VERSION:
-          counts = update_index(db, vendors)
-        elif args.vendor:
-          sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+      try:
+        with closing(sqlite3.connect(DB_PATH)) as db:
+          version = schema_version(db)
+          if version > SCHEMA_VERSION:
+            sys.exit("ccsi: the index was built by a newer ccsi version")
+          if version == SCHEMA_VERSION:
+            if not has_v3_tables(db):
+              raise sqlite3.DatabaseError("incomplete v3 schema")
+            if indexed_extractor_version(db) == EXTRACTOR_VERSION:
+              counts = update_index(db, vendors)
+            elif args.vendor:
+              sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+            else:
+              indexed_paths = previously_indexed_paths(db, version)
+          elif args.vendor:
+            sys.exit("ccsi: rebuilding the index requires all sources. Run ccsi index without --vendor.")
+          else:
+            indexed_paths = previously_indexed_paths(db, version)
+      except sqlite3.DatabaseError as exc:
+        if is_corruption_error(exc):
+          if args.vendor:
+            sys.exit(f"ccsi: index database is corrupted ({exc}); run ccsi index without --vendor to rebuild")
+          print(f"ccsi: rebuilding corrupted index: {exc}", file=sys.stderr)
+          counts = None
+          indexed_paths = frozenset()
+        elif isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc).lower() or "busy" in str(exc).lower()):
+          sys.exit(f"ccsi: index database is busy: {exc}")
         else:
-          indexed_paths = previously_indexed_paths(db, version)
+          raise
     if counts is None:
       counts = rebuild_index(vendors, indexed_paths)
     scanned, updated, failed, total = counts
@@ -620,7 +830,7 @@ def cmd_index(args):
 
 
 FTS_SYNTAX_RE = re.compile(r'["*()^:]|\b(?:AND|OR|NOT|NEAR(?:/\d+)?)\b')
-QUERY_TERM_RE = re.compile(r'"([^"]+)"|(\S+)')
+QUERY_TERM_RE = re.compile(r'"((?:[^"]|"")+)"|(\S+)')
 NEAR_OP_RE = re.compile(r"^NEAR(?:/\d+)?$")
 
 
@@ -638,12 +848,17 @@ def escape_like(token):
   return "%" + token.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
 
 
+def escape_like_prefix(prefix):
+  return prefix.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+
+
 def parse_search_query(query):
   has_long_term = False
   has_short_term = False
   for quoted, bare in QUERY_TERM_RE.findall(query):
     if quoted:
-      if len(quoted) >= 3:
+      unescaped = quoted.replace('""', '"')
+      if len(unescaped) >= 3:
         has_long_term = True
       else:
         has_short_term = True
@@ -670,8 +885,8 @@ def path_filters(args, path_column):
   sql, params = "", []
   if args.vendor:
     roots = [root for vendor, root in ROOTS if vendor in args.vendor]
-    sql += " AND (" + " OR ".join(f"{path_column} LIKE ?" for _ in roots) + ")"
-    params.extend(root + os.sep + "%" for root in roots)
+    sql += " AND (" + " OR ".join(f"{path_column} LIKE ? ESCAPE '!'" for _ in roots) + ")"
+    params.extend(escape_like_prefix(root + os.sep) for root in roots)
   for ex in args.exclude_session:
     if ex:
       sql += f" AND {path_column} NOT LIKE ? ESCAPE '!'"
@@ -897,11 +1112,8 @@ def seek_ts_spans_pread(fd, size, ts_bytes):
 def parse_single_line_rows(path, vendor, raw):
   if vendor == "cc" and b'"message"' not in raw and b"\\u" not in raw:
     return []
-  try:
-    obj = json.loads(raw.decode("utf-8", errors="replace"))
-  except json.JSONDecodeError:
-    return []
-  if not isinstance(obj, dict):
+  obj, valid = parse_json_object(raw.decode("utf-8", errors="replace"))
+  if not valid or obj is None:
     return []
   return extract_rows(path, vendor, records=[obj])
 
@@ -1076,11 +1288,8 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
     line_start = buf.rfind(b"\n", 0, pos) + 1
     nl = buf.find(b"\n", pos)
     line_end = nl + 1 if nl != -1 else len(buf)
-    try:
-      obj = json.loads(buf[line_start:line_end].decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-      obj = None
-    if isinstance(obj, dict):
+    obj, valid = parse_json_object(buf[line_start:line_end].decode("utf-8", errors="replace"))
+    if valid and obj is not None:
       matched.append(obj)
     pos = buf.find(ts_bytes, line_end)
   rows = extract_rows(path, vendor, records=matched) if matched else []
@@ -1252,6 +1461,9 @@ def short_snippet_for(text, tokens, radius=120):
   return prefix + "".join(parts) + suffix
 
 
+SYNTH_TOKEN_BYTES = (b"[", b"]", "\u2014".encode("utf-8"))
+
+
 def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list):
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -1269,10 +1481,12 @@ def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list)
       return False
   finally:
     os.close(fd)
-  # JSONL strings may encode characters as \uXXXX; fall back to full parse when present.
   if b"\\u" in buf:
     return True
-  # bytes.lower() only folds ASCII A-Z, leaving UTF-8 multibyte sequences intact.
+  if any(any(marker in tok for marker in SYNTH_TOKEN_BYTES) for tok in token_bytes_list):
+    return True
+  if b"\\" in buf and any(b"\\" in tok or b"/" in tok for tok in token_bytes_list):
+    return True
   low = buf.lower()
   return all(tok in low for tok in token_bytes_list)
 
@@ -1344,6 +1558,12 @@ def search_short_scan_contentless(db, extractor, args, short_tokens):
 
 
 def cmd_search(args):
+  if args.k < 0:
+    sys.exit("query error: -k must be >= 0")
+  if args.context < 0:
+    sys.exit("query error: -C/--context must be >= 0")
+  if args.scan_limit < 0:
+    sys.exit("query error: --scan-limit must be >= 0")
   query = " ".join(args.query)
   fts_query, short_tokens = parse_search_query(query)
   short_scan_tokens = None
@@ -1364,24 +1584,37 @@ def cmd_search(args):
         search_legacy(db, args, fts_query, short_tokens)
     print("(no hits)")
     return
-  with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-    db.execute("BEGIN")
-    version = schema_version(db)
-    if short_scan_tokens is not None:
-      if version < SCHEMA_VERSION:
-        found = search_short_scan_legacy(db, args, short_scan_tokens)
+  try:
+    with closing(sqlite3.connect(DB_PATH.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+      db.execute("BEGIN")
+      version = schema_version(db)
+      if short_scan_tokens is not None:
+        if version < SCHEMA_VERSION:
+          if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'messages'").fetchone():
+            sys.exit("ccsi: index database is empty or corrupted; run ccsi index to rebuild")
+          found = search_short_scan_legacy(db, args, short_scan_tokens)
+        else:
+          if version == SCHEMA_VERSION and not has_v3_tables(db):
+            sys.exit("ccsi: index database is corrupted or incomplete; run ccsi index to rebuild")
+          extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
+          if extractor is None:
+            sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
+          found = search_short_scan_contentless(db, extractor, args, short_scan_tokens)
+      elif version < SCHEMA_VERSION:
+        if not db.execute("SELECT 1 FROM sqlite_schema WHERE name = 'messages'").fetchone():
+          sys.exit("ccsi: index database is empty or corrupted; run ccsi index to rebuild")
+        found = search_legacy(db, args, fts_query, short_tokens)
       else:
+        if version == SCHEMA_VERSION and not has_v3_tables(db):
+          sys.exit("ccsi: index database is corrupted or incomplete; run ccsi index to rebuild")
         extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
         if extractor is None:
           sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
-        found = search_short_scan_contentless(db, extractor, args, short_scan_tokens)
-    elif version < SCHEMA_VERSION:
-      found = search_legacy(db, args, fts_query, short_tokens)
-    else:
-      extractor = EXTRACTORS.get(indexed_extractor_version(db)) if version == SCHEMA_VERSION else None
-      if extractor is None:
-        sys.exit("ccsi: incompatible index version. Run ccsi index or use the matching ccsi version.")
-      found = search_contentless(db, extractor, args, fts_query, short_tokens)
+        found = search_contentless(db, extractor, args, fts_query, short_tokens)
+  except sqlite3.DatabaseError as exc:
+    if isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc).lower() or "busy" in str(exc).lower()):
+      sys.exit(f"query error: {exc}")
+    sys.exit(f"ccsi: index database is corrupted or unreadable ({exc}); run ccsi index to rebuild")
   if not found:
     print("(no hits)")
 
@@ -1418,6 +1651,7 @@ def main():
   sub = ap.add_subparsers(dest="cmd", required=True)
   p_index = sub.add_parser("index", help="build or incrementally update the index")
   p_index.add_argument("--vendor", action="append", choices=VENDORS, help="restrict to one vendor (default all)")
+  p_index.add_argument("--lock-timeout", type=float, default=None, help="seconds to wait for index lock before exiting (default 60 or CCSI_LOCK_TIMEOUT)")
   p_index.set_defaults(fn=cmd_index)
   p_search = sub.add_parser("search", help="full-text search indexed messages")
   p_search.add_argument("query", nargs="+")

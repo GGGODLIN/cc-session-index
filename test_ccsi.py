@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import io
 import json
 import os
@@ -1110,6 +1111,478 @@ class LargeFilePrefilterTest(unittest.TestCase):
 
       neg_limit = run_ccsi(home, "search", "--short-scan", "--scan-limit", "-1", "白話", check=False)
       self.assertNotEqual(neg_limit.returncode, 0)
+
+
+class HardeningChaosTest(unittest.TestCase):
+  def test_inplace_rewrite_larger_same_inode_replaces_old_rows(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/rewrite-larger.jsonl"
+      session.parent.mkdir(parents=True)
+      session.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "oldshortneedle"},
+      }) + "\n")
+      orig_ino = session.stat().st_ino
+      run_ccsi(home, "index")
+      self.assertIn("oldshortneedle", run_ccsi(home, "search", "oldshortneedle").stdout)
+
+      session.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:01:00Z",
+        "message": {"role": "user", "content": "newmuchlongerneedle_after_inplace_rewrite"},
+      }) + "\n")
+      self.assertEqual(session.stat().st_ino, orig_ino)
+      t = session.stat().st_mtime + 10
+      os.utime(session, (t, t))
+      run_ccsi(home, "index")
+
+      self.assertIn(">>>newmuchlongerneedle<<<_after_inplace_rewrite", run_ccsi(home, "search", "newmuchlongerneedle").stdout)
+      self.assertEqual(run_ccsi(home, "search", "oldshortneedle").stdout, "(no hits)\n")
+      with closing(sqlite3.connect(db_path_for(home))) as db:
+        old_cnt = db.execute("SELECT count(*) FROM messages WHERE messages MATCH 'oldshortneedle'").fetchone()[0]
+        new_cnt = db.execute("SELECT count(*) FROM messages WHERE messages MATCH 'newmuchlongerneedle'").fetchone()[0]
+      self.assertEqual(old_cnt, 0)
+      self.assertEqual(new_cnt, 1)
+
+  def test_inplace_rewrite_same_line_len_plus_append_reindexes(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/rewrite-boundary.jsonl"
+      session.parent.mkdir(parents=True)
+      line1_old = json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "firstold01"},
+      }) + "\n"
+      session.write_text(line1_old)
+      run_ccsi(home, "index")
+
+      line1_new = json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:01Z",
+        "message": {"role": "user", "content": "firstnew01"},
+      }) + "\n"
+      line2_new = json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-10-19T00:00:02Z",
+        "message": {"role": "assistant", "content": "secondappend02"},
+      }) + "\n"
+      self.assertEqual(len(line1_old.encode()), len(line1_new.encode()))
+      session.write_text(line1_new + line2_new)
+      t = session.stat().st_mtime + 10
+      os.utime(session, (t, t))
+      run_ccsi(home, "index")
+
+      self.assertEqual(run_ccsi(home, "search", "firstold01").stdout, "(no hits)\n")
+      self.assertIn("firstnew01", run_ccsi(home, "search", "firstnew01").stdout)
+      self.assertIn("secondappend02", run_ccsi(home, "search", "secondappend02").stdout)
+      with closing(sqlite3.connect(db_path_for(home))) as db:
+        old_cnt = db.execute("SELECT count(*) FROM messages WHERE messages MATCH 'firstold01'").fetchone()[0]
+      self.assertEqual(old_cnt, 0)
+
+  def test_mtime_rollback_with_larger_size_forces_full_reindex(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/mtime-rollback.jsonl"
+      session.parent.mkdir(parents=True)
+      session.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "rollbackoldneedle"},
+      }) + "\n")
+      future_ts = time.time() + 200
+      os.utime(session, (future_ts, future_ts))
+      run_ccsi(home, "index")
+
+      session.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "rollbacknewneedle_extra_content"},
+      }) + "\n")
+      older_ts = future_ts - 150
+      os.utime(session, (older_ts, older_ts))
+      run_ccsi(home, "index")
+
+      self.assertEqual(run_ccsi(home, "search", "rollbackoldneedle").stdout, "(no hits)\n")
+      self.assertIn(">>>rollbacknewneedle<<<_extra_content", run_ccsi(home, "search", "rollbacknewneedle").stdout)
+
+  def test_corrupt_deep_nested_and_partial_jsonl_do_not_crash(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/corrupt.jsonl"
+      session.parent.mkdir(parents=True)
+      deep = ("[" * 3000) + ("]" * 3000) + "\n"
+      raw = (
+        (json.dumps({"type": "user", "timestamp": "2026-10-19T00:00:00Z", "message": {"role": "user", "content": "validbeforecorrupt"}}) + "\n").encode()
+        + b"\xff\xfe{not valid json\n"
+        + deep.encode()
+        + b"123\n\"scalar\"\n[1,2]\nnull\n"
+        + (json.dumps({"type": "assistant", "timestamp": "2026-10-19T00:00:01Z", "message": {"role": "assistant", "content": "validaftercorrupt"}}) + "\n").encode()
+        + b'{"type":"user","timestamp":"2026-10-19T00:00:02Z","message":{"role":"user","content":"trailinghalf'
+      )
+      session.write_bytes(raw)
+
+      idx = run_ccsi(home, "index")
+      self.assertIn("failed=0 rows=2 ", idx.stdout)
+      self.assertIn("validbeforecorrupt", run_ccsi(home, "search", "validbeforecorrupt").stdout)
+      self.assertIn("validaftercorrupt", run_ccsi(home, "search", "validaftercorrupt").stdout)
+      evs = run_ccsi(home, "events").stdout
+      self.assertIn("validaftercorrupt", evs)
+
+      with session.open("ab") as f:
+        f.write(b'completed"}}\n')
+      t = session.stat().st_mtime + 5
+      os.utime(session, (t, t))
+      idx2 = run_ccsi(home, "index")
+      self.assertIn("failed=0 rows=3 ", idx2.stdout)
+      self.assertIn("trailinghalfcompleted", run_ccsi(home, "search", "trailinghalfcompleted").stdout)
+
+  def test_file_deleted_between_stat_and_open_is_pruned_without_failing(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      doomed = cc_session(home, "doomed", "doomedraceneedle")
+      keeper = cc_session(home, "keeper", "keeperraceneedle")
+      run_ccsi(home, "index")
+      t = doomed.stat().st_mtime + 10
+      os.utime(doomed, (t, t))
+
+      ccsi_mod = load_ccsi_module()
+      orig_read = ccsi_mod.read_jsonl_records
+
+      def unlink_then_read(path, *a, **kw):
+        if Path(path) == doomed and doomed.exists():
+          doomed.unlink()
+        return orig_read(path, *a, **kw)
+
+      with (
+        mock.patch.object(ccsi_mod, "ROOTS", (("cc", str(home / ".claude/projects")),)),
+        mock.patch.object(ccsi_mod, "ROOT", str(home / ".claude/projects")),
+        mock.patch.object(ccsi_mod, "read_jsonl_records", side_effect=unlink_then_read),
+        closing(sqlite3.connect(db_path_for(home))) as db,
+      ):
+        scanned, updated, failed, total = ccsi_mod.update_index(db, {"cc"})
+
+      self.assertEqual(failed, 0)
+      self.assertEqual(total, 1)
+      self.assertEqual(run_ccsi(home, "search", "doomedraceneedle").stdout, "(no hits)\n")
+      self.assertIn(keeper.name, run_ccsi(home, "search", "keeperraceneedle").stdout)
+
+  def test_corrupted_and_empty_sqlite_db_recovery_and_clean_search_errors(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "recover", "recoverdbneedle 記憶")
+      run_ccsi(home, "index")
+      db_path = db_path_for(home)
+
+      db_path.write_bytes(b"NOT_A_VALID_SQLITE_HEADER_AT_ALL")
+      search_bad = run_ccsi(home, "search", "recoverdbneedle", check=False)
+      self.assertNotEqual(search_bad.returncode, 0)
+      self.assertNotIn("Traceback", search_bad.stderr)
+
+      partial_idx = run_ccsi(home, "index", "--vendor", "cc", check=False)
+      self.assertNotEqual(partial_idx.returncode, 0)
+      self.assertNotIn("Traceback", partial_idx.stderr)
+
+      rebuilt = run_ccsi(home, "index")
+      self.assertIn("rows=1 ", rebuilt.stdout)
+      self.assertIn("recoverdbneedle", run_ccsi(home, "search", "recoverdbneedle").stdout)
+
+      db_path.write_bytes(b"")
+      empty_short = run_ccsi(home, "search", "--short-scan", "記憶", check=False)
+      self.assertNotEqual(empty_short.returncode, 0)
+      self.assertNotIn("Traceback", empty_short.stderr)
+
+      with closing(sqlite3.connect(db_path)) as db:
+        db.execute("PRAGMA user_version = 3")
+        db.commit()
+      broken_v3 = run_ccsi(home, "search", "recoverdbneedle", check=False)
+      self.assertNotEqual(broken_v3.returncode, 0)
+      self.assertNotIn("Traceback", broken_v3.stderr)
+
+      run_ccsi(home, "index")
+      self.assertIn("recoverdbneedle", run_ccsi(home, "search", "recoverdbneedle").stdout)
+
+  def test_wal_upgrade_preserves_old_index_until_reader_closes(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "wal-old", "oldwalneedle")
+      run_ccsi(home, "index", script=LEGACY_SCRIPT)
+      db_path = db_path_for(home)
+      before = db_path.stat().st_ino
+      wal_path = db_path.with_name(db_path.name + "-wal")
+      shm_path = db_path.with_name(db_path.name + "-shm")
+      cc_session(home, "wal-new", "freshwalneedle")
+
+      with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as reader:
+        with closing(sqlite3.connect(db_path)) as writer:
+          self.assertEqual(writer.execute("PRAGMA journal_mode=WAL").fetchone(), ("wal",))
+          writer.execute("UPDATE files SET rows = 999")
+          writer.commit()
+          reader.execute("BEGIN")
+          self.assertEqual(reader.execute("SELECT rows FROM files").fetchone(), (999,))
+
+        self.assertTrue(wal_path.exists())
+        self.assertTrue(shm_path.exists())
+        blocked = run_ccsi(home, "index", check=False)
+        self.assertNotEqual(blocked.returncode, 0, blocked.stdout)
+        self.assertIn("kept the existing WAL index", blocked.stderr)
+        self.assertEqual(db_path.stat().st_ino, before)
+        self.assertTrue(wal_path.exists())
+        self.assertTrue(shm_path.exists())
+        self.assertEqual(reader.execute("SELECT rows FROM files").fetchone(), (999,))
+        self.assertIn("oldwalneedle", run_ccsi(home, "search", "oldwalneedle").stdout)
+        self.assertEqual(run_ccsi(home, "search", "freshwalneedle").stdout, "(no hits)\n")
+
+      run_ccsi(home, "index")
+      self.assertNotEqual(db_path.stat().st_ino, before)
+      self.assertFalse(wal_path.exists())
+      self.assertFalse(shm_path.exists())
+      self.assertFalse(db_path.with_name(db_path.name + "-journal").exists())
+      with closing(sqlite3.connect(db_path)) as db:
+        self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+      self.assertIn("oldwalneedle", run_ccsi(home, "search", "oldwalneedle").stdout)
+      self.assertIn("freshwalneedle", run_ccsi(home, "search", "freshwalneedle").stdout)
+
+  def test_cross_process_lock_timeout_and_recovery_after_release(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "locked", "locktestneedle")
+      db_dir = db_path_for(home).parent
+      db_dir.mkdir(parents=True, exist_ok=True)
+      lock_path = db_dir / "index.lock"
+      fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+      try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("ascii"))
+        blocked = run_ccsi(
+          home,
+          "index",
+          check=False,
+          extra_env={"CCSI_LOCK_TIMEOUT": "0.2"},
+          timeout=5,
+        )
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("timed out", blocked.stderr)
+      finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+      recovered = run_ccsi(home, "index", extra_env={"CCSI_LOCK_TIMEOUT": "2"})
+      self.assertIn("rows=1 ", recovered.stdout)
+      self.assertIn("locktestneedle", run_ccsi(home, "search", "locktestneedle").stdout)
+
+  def test_negative_k_context_and_scan_limit_rejected(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "bounds-a", "boundsneedle alpha 白話")
+      cc_session(home, "bounds-b", "boundsneedle beta 白話")
+
+      pre_neg_scan = run_ccsi(home, "search", "--short-scan", "--scan-limit", "-1", "白話", check=False)
+      self.assertNotEqual(pre_neg_scan.returncode, 0)
+
+      run_ccsi(home, "index")
+      for args in (
+        ("boundsneedle", "-k", "-1"),
+        ("boundsneedle", "-C", "-1"),
+        ("--short-scan", "-k", "-1", "白話"),
+        ("--short-scan", "-C", "-1", "白話"),
+      ):
+        with self.subTest(args=args):
+          res = run_ccsi(home, "search", *args, check=False)
+          self.assertNotEqual(res.returncode, 0)
+
+      zero_k = run_ccsi(home, "search", "boundsneedle", "-k", "0")
+      self.assertEqual(zero_k.stdout, "(no hits)\n")
+
+  def test_vendor_filter_escapes_like_wildcards_in_root_path(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_root = home / "cc_root"
+      codex_root = home / "ccXroot"
+      cc_file = cc_root / "projects/p/a.jsonl"
+      cc_file.parent.mkdir(parents=True)
+      cc_file.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "wildcardrootneedle"},
+      }) + "\n")
+      fake_codex = codex_root / "projects/p/b.jsonl"
+      fake_codex.parent.mkdir(parents=True)
+      fake_codex.write_text(json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "wildcardrootneedle"},
+      }) + "\n")
+
+      run_ccsi(home, "index", extra_env={"CLAUDE_CONFIG_DIR": str(codex_root)})
+      run_ccsi(home, "index", extra_env={"CLAUDE_CONFIG_DIR": str(cc_root)})
+
+      out = run_ccsi(home, "search", "wildcardrootneedle", "--vendor", "cc", extra_env={"CLAUDE_CONFIG_DIR": str(cc_root)}).stdout
+      self.assertEqual(out.count("--- [cc]"), 1)
+      self.assertIn("a.jsonl", out)
+      self.assertNotIn("b.jsonl", out)
+
+  def test_short_scan_matches_json_escaped_chars_and_synthesized_tool_tags(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      s_slash = home / ".claude/projects/probe/slash.jsonl"
+      s_bs = home / ".claude/projects/probe/backslash.jsonl"
+      s_tool = home / ".claude/projects/probe/tool.jsonl"
+      s_slash.parent.mkdir(parents=True)
+      s_slash.write_text('{"type":"user","timestamp":"2026-10-19T00:00:00Z","message":{"role":"user","content":"api\\/v2"}}\n')
+      s_bs.write_text('{"type":"user","timestamp":"2026-10-19T00:00:01Z","message":{"role":"user","content":"c:\\\\go"}}\n')
+      s_tool.write_text(json.dumps({
+        "type": "assistant",
+        "timestamp": "2026-10-19T00:00:02Z",
+        "message": {"role": "assistant", "content": [
+          {"type": "tool_use", "id": "t1", "name": "jq", "input": {"command": "run"}},
+        ]},
+      }) + "\n")
+      run_ccsi(home, "index")
+
+      self.assertIn("slash.jsonl", run_ccsi(home, "search", "--short-scan", "i/").stdout)
+      self.assertIn("backslash.jsonl", run_ccsi(home, "search", "--short-scan", "\\g").stdout)
+      self.assertIn("tool.jsonl", run_ccsi(home, "search", "--short-scan", "[j").stdout)
+
+  def test_fts5_escaped_quote_phrase_and_punctuation_queries(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "special", 'literal a"b token foo:bar fn(x) err-code')
+      run_ccsi(home, "index")
+
+      for query in ('"a""b"', "foo:bar", "fn(x)", "err-code"):
+        with self.subTest(query=query):
+          res = run_ccsi(home, "search", query)
+          self.assertIn("special.jsonl", res.stdout)
+
+  def test_fifo_jsonl_does_not_hang_events_or_short_scan(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "healthy", "healthyfifoneedle 測試")
+      run_ccsi(home, "index")
+      fifo_path = home / ".claude/projects/probe/pipe.jsonl"
+      os.mkfifo(fifo_path)
+
+      evs = run_ccsi(home, "events", timeout=5)
+      self.assertIn("healthyfifoneedle", evs.stdout)
+
+      replaced = home / ".claude/projects/probe/healthy.jsonl"
+      fifo2 = home / ".claude/projects/probe/swap.pipe"
+      os.mkfifo(fifo2)
+      fifo2.replace(replaced)
+      short_res = run_ccsi(home, "search", "--short-scan", "測試", timeout=5)
+      self.assertEqual(short_res.stdout, "(no hits)\n")
+
+  def test_inplace_rewrite_non_message_same_length_plus_append_reindexes(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/rewrite-nonmsg.jsonl"
+      session.parent.mkdir(parents=True)
+      line1_old = json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:00:00Z",
+        "message": {"role": "user", "content": "oldsecretneedle"},
+      }) + "\n"
+      session.write_text(line1_old)
+      run_ccsi(home, "index")
+
+      prefix = '{"type":"progress","p":"'
+      suffix = '"}\n'
+      pad_len = len(line1_old.encode()) - len((prefix + suffix).encode())
+      line1_new = prefix + ("x" * pad_len) + suffix
+      self.assertEqual(len(line1_old.encode()), len(line1_new.encode()))
+      line2_new = json.dumps({
+        "type": "user",
+        "timestamp": "2026-10-19T00:01:00Z",
+        "message": {"role": "user", "content": "newsecretneedle"},
+      }) + "\n"
+      session.write_text(line1_new + line2_new)
+      t = session.stat().st_mtime + 10
+      os.utime(session, (t, t))
+      run_ccsi(home, "index")
+
+      self.assertEqual(run_ccsi(home, "search", "oldsecretneedle").stdout, "(no hits)\n")
+      self.assertIn("newsecretneedle", run_ccsi(home, "search", "newsecretneedle").stdout)
+      with closing(sqlite3.connect(db_path_for(home))) as db:
+        old_cnt = db.execute("SELECT count(*) FROM messages WHERE messages MATCH 'oldsecretneedle'").fetchone()[0]
+        new_cnt = db.execute("SELECT count(*) FROM messages WHERE messages MATCH 'newsecretneedle'").fetchone()[0]
+      self.assertEqual(old_cnt, 0)
+      self.assertEqual(new_cnt, 1)
+
+  def test_corrupted_v3_wrong_columns_and_broken_fts_auto_recovers(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      cc_session(home, "schema-heal", "schemahealneedle")
+      db_path = db_path_for(home)
+      db_path.parent.mkdir(parents=True, exist_ok=True)
+      with closing(sqlite3.connect(db_path)) as db:
+        db.executescript("""
+          CREATE TABLE paths (id INTEGER);
+          CREATE TABLE files (id INTEGER);
+          CREATE TABLE message_refs (id INTEGER);
+          CREATE TABLE metadata (wrong_col TEXT);
+          CREATE TABLE messages (id INTEGER);
+          PRAGMA user_version = 3;
+        """)
+
+      bad_search = run_ccsi(home, "search", "schemahealneedle", check=False)
+      self.assertNotEqual(bad_search.returncode, 0)
+      self.assertNotIn("Traceback", bad_search.stderr)
+
+      bad_vendor = run_ccsi(home, "index", "--vendor", "cc", check=False)
+      self.assertNotEqual(bad_vendor.returncode, 0)
+      self.assertNotIn("Traceback", bad_vendor.stderr)
+
+      healed = run_ccsi(home, "index")
+      self.assertIn("rows=1 ", healed.stdout)
+      self.assertIn("schemahealneedle", run_ccsi(home, "search", "schemahealneedle").stdout)
+
+  def test_large_file_context_search_survives_mid_search_truncation_and_bad_utf8(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      session = home / ".claude/projects/probe/large-race.jsonl"
+      session.parent.mkdir(parents=True)
+      filler = "z" * 400
+      lines = []
+      for i in range(90):
+        content = f"msg-{i} {filler}" if i != 45 else f"targetlargeraceneedle {filler}"
+        lines.append((json.dumps({
+          "type": "user",
+          "timestamp": f"2026-10-19T00:{i // 60:02d}:{i % 60:02d}Z",
+          "message": {"role": "user", "content": content},
+        }) + "\n").encode("utf-8"))
+      lines.insert(44, b"\xff\xfe{bad utf8 line\n")
+      session.write_bytes(b"".join(lines))
+      run_ccsi(home, "index")
+
+      ok_ctx = run_ccsi(home, "search", "targetlargeraceneedle", "-C", "2")
+      self.assertIn("targetlargeraceneedle", ok_ctx.stdout)
+      self.assertIn("msg-44", ok_ctx.stdout)
+      self.assertIn("msg-46", ok_ctx.stdout)
+
+      ccsi_mod = load_ccsi_module()
+      orig_collect = ccsi_mod.collect_local_context_pread
+
+      def truncate_during_context(*a, **kw):
+        session.write_bytes(b"")
+        return orig_collect(*a, **kw)
+
+      with (
+        mock.patch.object(ccsi_mod, "DB_PATH", db_path_for(home)),
+        mock.patch.object(ccsi_mod, "ROOTS", (("cc", str(home / ".claude/projects")),)),
+        mock.patch.object(ccsi_mod, "ROOT", str(home / ".claude/projects")),
+        mock.patch.object(ccsi_mod, "collect_local_context_pread", side_effect=truncate_during_context),
+        closing(sqlite3.connect(db_path_for(home).resolve().as_uri() + "?mode=ro", uri=True)) as db,
+      ):
+        args = argparse.Namespace(k=5, vendor=None, exclude_session=[], context=2)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+          found = ccsi_mod.search_contentless(db, ccsi_mod.extract_rows, args, "targetlargeraceneedle", [])
+      self.assertEqual(found, 0)
 
 
 if __name__ == "__main__":
