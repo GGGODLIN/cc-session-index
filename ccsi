@@ -3,12 +3,14 @@ import argparse
 import errno
 import fcntl
 import json
+import marshal
 import math
 import os
 import re
 import sqlite3
 import stat
 import sys
+import tempfile
 import time
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -145,6 +147,112 @@ def iter_files(vendors, onerror=None):
       for n in names:
         if n.endswith(".jsonl"):
           yield vendor, os.path.join(dirpath, n)
+
+
+_USE_DIR_FD = (os.stat in os.supports_dir_fd) and hasattr(os, "O_DIRECTORY")
+
+
+def iter_files_stat(vendors, onerror=None, onstat_error=None):
+  _open = os.open
+  _close = os.close
+  _scandir = os.scandir
+  _stat = os.stat
+  _s_isdir = stat.S_ISDIR
+  _sep = os.sep
+  _o_dir = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+  for vendor, root in ROOTS:
+    if vendor not in vendors or not os.path.isdir(root):
+      continue
+    prune_codex = vendor == "cc"
+    stack = [root]
+    while stack:
+      dirpath = stack.pop()
+      prefix = dirpath if dirpath.endswith(_sep) else dirpath + _sep
+      is_root = prune_codex and dirpath == root
+      if _USE_DIR_FD:
+        try:
+          dfd = _open(dirpath, _o_dir)
+        except OSError as exc:
+          if onerror is not None:
+            onerror(exc)
+          continue
+        try:
+          try:
+            it = _scandir(dfd)
+          except OSError as exc:
+            exc.filename = dirpath
+            if onerror is not None:
+              onerror(exc)
+            continue
+          with it:
+            for entry in it:
+              name = entry.name
+              if name.endswith(".jsonl"):
+                try:
+                  is_d = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                  is_d = False
+                if is_d:
+                  if not (is_root and name == "codex"):
+                    stack.append(prefix + name)
+                  continue
+                try:
+                  st = _stat(name, dir_fd=dfd)
+                except FileNotFoundError:
+                  continue
+                except OSError as exc:
+                  if onstat_error is not None:
+                    onstat_error(exc, prefix + name)
+                  continue
+                if _s_isdir(st.st_mode):
+                  continue
+                yield vendor, prefix + name, st
+              else:
+                try:
+                  is_d = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                  continue
+                if is_d and not (is_root and name == "codex"):
+                  stack.append(prefix + name)
+        finally:
+          _close(dfd)
+      else:
+        try:
+          it = _scandir(dirpath)
+        except OSError as exc:
+          if onerror is not None:
+            onerror(exc)
+          continue
+        with it:
+          for entry in it:
+            name = entry.name
+            if name.endswith(".jsonl"):
+              try:
+                is_d = entry.is_dir(follow_symlinks=False)
+              except OSError:
+                is_d = False
+              if is_d:
+                if not (is_root and name == "codex"):
+                  stack.append(entry.path)
+                continue
+              try:
+                st = entry.stat(follow_symlinks=True)
+              except FileNotFoundError:
+                continue
+              except OSError as exc:
+                if onstat_error is not None:
+                  onstat_error(exc, entry.path)
+                continue
+              if _s_isdir(st.st_mode):
+                continue
+              yield vendor, entry.path, st
+            else:
+              try:
+                is_d = entry.is_dir(follow_symlinks=False)
+              except OSError:
+                continue
+              if is_d and not (is_root and name == "codex"):
+                stack.append(entry.path)
 
 
 def parse_json_object(text):
@@ -465,15 +573,23 @@ def delete_file_messages(db, path_id):
 
 def prune_deleted_files(db, vendors, known, unseen):
   roots = [root for vendor, root in ROOTS if vendor in vendors]
+  root_prefixes = [(root, root + os.sep) for root in roots]
   for path in unseen:
-    matching_roots = [root for root in roots if path.startswith(root + os.sep)]
+    matching_roots = [root for root, pfx in root_prefixes if path.startswith(pfx)]
     if not matching_roots:
       continue
     try:
       os.stat(path)
     except FileNotFoundError:
       if any(os.path.isdir(root) for root in matching_roots):
-        path_id = known[path][5]
+        entry = known.get(path)
+        if entry is not None and len(entry) >= 6:
+          path_id = entry[5]
+        else:
+          row = db.execute("SELECT path_id FROM paths WHERE path = ?", (path,)).fetchone()
+          if row is None:
+            continue
+          path_id = row[0]
         delete_file_messages(db, path_id)
         db.execute("DELETE FROM files WHERE path_id = ?", (path_id,))
         db.execute("DELETE FROM paths WHERE path_id = ?", (path_id,))
@@ -515,16 +631,296 @@ def verify_append_boundary(fd, start_offset, size, path, vendor, expected_last):
   return False
 
 
-def update_index(db, vendors, indexed_paths=frozenset()):
-  known = {
-    path: (mtime, size, offset, ino, rows, path_id)
-    for path, mtime, size, offset, ino, rows, path_id in db.execute(
-      "SELECT path, mtime, size, offset, ino, rows, path_id FROM files JOIN paths USING (path_id)"
+def _scan_worker_chunk(chunk_items, lo_key, hi_key, root_prefixes, db_con):
+  if lo_key is None and hi_key is None:
+    cur = db_con.execute(
+      "SELECT p.path, f.mtime, f.size, f.ino FROM files f CROSS JOIN paths p ON p.path_id = f.path_id"
     )
-  }
-  unseen = set(known)
+  elif lo_key is None:
+    cur = db_con.execute(
+      "SELECT p.path, f.mtime, f.size, f.ino FROM paths p JOIN files f USING (path_id) WHERE p.path < ?",
+      (hi_key,),
+    )
+  elif hi_key is None:
+    cur = db_con.execute(
+      "SELECT p.path, f.mtime, f.size, f.ino FROM paths p JOIN files f USING (path_id) WHERE p.path >= ?",
+      (lo_key,),
+    )
+  else:
+    cur = db_con.execute(
+      "SELECT p.path, f.mtime, f.size, f.ino FROM paths p JOIN files f USING (path_id) WHERE p.path >= ? AND p.path < ?",
+      (lo_key, hi_key),
+    )
+  known = {path: (mtime, size, ino) for path, mtime, size, ino in cur}
+  known_pop = known.pop
+  _open = os.open
+  _close = os.close
+  _scandir = os.scandir
+  _stat = os.stat
+  _s_isdir = stat.S_ISDIR
+  _sep = os.sep
+  _o_dir = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+
+  scanned = 0
+  changed = []
+  walk_errors = []
+  stat_errors = []
+
+  for key, is_dir, vendor, data in chunk_items:
+    if not is_dir:
+      mt, sz, ino = data
+      scanned += 1
+      prev = known_pop(key, None)
+      if prev is None or prev[0] != mt or prev[1] != sz or prev[2] != ino:
+        changed.append((vendor, key, mt, sz, ino, prev))
+      continue
+    stack = [data]
+    while stack:
+      dirpath = stack.pop()
+      prefix = dirpath if dirpath.endswith(_sep) else dirpath + _sep
+      try:
+        dfd = _open(dirpath, _o_dir)
+      except OSError as exc:
+        walk_errors.append((exc.errno, exc.strerror, dirpath))
+        continue
+      try:
+        try:
+          it = _scandir(dfd)
+        except OSError as exc:
+          walk_errors.append((exc.errno, exc.strerror, dirpath))
+          continue
+        with it:
+          for entry in it:
+            name = entry.name
+            if name.endswith(".jsonl"):
+              try:
+                is_d = entry.is_dir(follow_symlinks=False)
+              except OSError:
+                is_d = False
+              if is_d:
+                stack.append(prefix + name)
+                continue
+              try:
+                st = _stat(name, dir_fd=dfd)
+              except FileNotFoundError:
+                continue
+              except OSError as exc:
+                stat_errors.append((exc.errno, exc.strerror, prefix + name))
+                continue
+              if _s_isdir(st.st_mode):
+                continue
+              path = prefix + name
+              scanned += 1
+              prev = known_pop(path, None)
+              if prev is None or prev[0] != st.st_mtime or prev[1] != st.st_size or prev[2] != st.st_ino:
+                changed.append((vendor, path, st.st_mtime, st.st_size, st.st_ino, prev))
+            else:
+              try:
+                is_d = entry.is_dir(follow_symlinks=False)
+              except OSError:
+                continue
+              if is_d:
+                stack.append(prefix + name)
+      finally:
+        _close(dfd)
+
+  unseen = [p for p in known if any(p.startswith(pfx) for pfx in root_prefixes)]
+  return scanned, changed, unseen, walk_errors, stat_errors
+
+
+def _parallel_scan_diff(db, vendors, record_walk_error, record_read_error):
+  if not (_USE_DIR_FD and hasattr(os, "fork")) or db.in_transaction:
+    return None
+  db_list = db.execute("PRAGMA database_list").fetchone()
+  db_file = db_list[2] if db_list and len(db_list) >= 3 else ""
+  if not db_file or not os.path.isfile(db_file):
+    return None
+  max_pid = db.execute("SELECT max(path_id) FROM files").fetchone()[0]
+  if not max_pid or max_pid < 2000:
+    return None
+
+  _sep = os.sep
+  active_roots = [(vendor, root) for vendor, root in ROOTS if vendor in vendors and os.path.isdir(root)]
+  if not active_roots:
+    return None
+  root_prefixes = [root if root.endswith(_sep) else root + _sep for _, root in active_roots]
+  # Ensure roots do not nest/overlap so path range partitions are strictly disjoint.
+  for i, pfx_a in enumerate(root_prefixes):
+    for j, pfx_b in enumerate(root_prefixes):
+      if i != j and (pfx_a == pfx_b or pfx_a.startswith(pfx_b)):
+        return None
+
+  _open = os.open
+  _close = os.close
+  _scandir = os.scandir
+  _stat = os.stat
+  _s_isdir = stat.S_ISDIR
+  _o_dir = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+
+  top_items = []
+  for vendor, root in active_roots:
+    prefix = root if root.endswith(_sep) else root + _sep
+    prune_codex = vendor == "cc"
+    try:
+      dfd = _open(root, _o_dir)
+    except OSError as exc:
+      record_walk_error(exc)
+      continue
+    try:
+      try:
+        it = _scandir(dfd)
+      except OSError as exc:
+        exc.filename = root
+        record_walk_error(exc)
+        continue
+      with it:
+        for entry in it:
+          name = entry.name
+          if name.endswith(".jsonl"):
+            try:
+              is_d = entry.is_dir(follow_symlinks=False)
+            except OSError:
+              is_d = False
+            if is_d:
+              if not (prune_codex and name == "codex"):
+                dpath = prefix + name
+                top_items.append((dpath + _sep, True, vendor, dpath))
+              continue
+            try:
+              st = _stat(name, dir_fd=dfd)
+            except FileNotFoundError:
+              continue
+            except OSError as exc:
+              record_read_error(exc, prefix + name)
+              continue
+            if _s_isdir(st.st_mode):
+              continue
+            fpath = prefix + name
+            top_items.append((fpath, False, vendor, (st.st_mtime, st.st_size, st.st_ino)))
+          else:
+            try:
+              is_d = entry.is_dir(follow_symlinks=False)
+            except OSError:
+              continue
+            if is_d and not (prune_codex and name == "codex"):
+              dpath = prefix + name
+              top_items.append((dpath + _sep, True, vendor, dpath))
+    finally:
+      _close(dfd)
+
+  n_workers = min(os.cpu_count() or 1, 4, len(top_items) // 4)
+  if n_workers < 2:
+    return None
+
+  top_items.sort(key=lambda x: x[0])
+  n = len(top_items)
+  chunks = []
+  bounds = []
+  for i in range(n_workers):
+    start = (i * n) // n_workers
+    end = ((i + 1) * n) // n_workers
+    chunks.append(top_items[start:end])
+    bounds.append(top_items[start][0])
+
+  tmp_files = []
+  pids = []
+  fork_failed = False
+  for i in range(1, n_workers):
+    lo_k = bounds[i]
+    hi_k = bounds[i + 1] if i + 1 < n_workers else None
+    # Use an unlinked anonymous temp file instead of os.pipe() so large change/unseen batches
+    # (>64 KB) cannot deadlock a child waiting on the parent while parent scans chunk 0.
+    tf = tempfile.TemporaryFile()
+    w_fd = tf.fileno()
+    try:
+      pid = os.fork()
+    except OSError:
+      tf.close()
+      fork_failed = True
+      break
+    if pid == 0:
+      for prev_tf in tmp_files:
+        try:
+          prev_tf.close()
+        except OSError:
+          pass
+      try:
+        wdb = sqlite3.connect(db_file)
+        wdb.execute("PRAGMA query_only = ON")
+        try:
+          res = _scan_worker_chunk(chunks[i], lo_k, hi_k, root_prefixes, wdb)
+        finally:
+          wdb.close()
+        data = marshal.dumps(res)
+        mv = memoryview(data)
+        written = 0
+        total_len = len(mv)
+        while written < total_len:
+          written += os.write(w_fd, mv[written:])
+      except BaseException:
+        os._exit(1)
+      os._exit(0)
+    else:
+      tmp_files.append(tf)
+      pids.append(pid)
+
+  if fork_failed:
+    for pid in pids:
+      try:
+        os.waitpid(pid, 0)
+      except ChildProcessError:
+        pass
+    for tf in tmp_files:
+      tf.close()
+    return None
+
+  # Parent runs chunk 0 concurrently with forked children
+  total_scanned, all_changed, all_unseen, all_walk_errs, all_stat_errs = _scan_worker_chunk(
+    chunks[0], None, bounds[1], root_prefixes, db
+  )
+
+  worker_failed = False
+  for pid in pids:
+    _, status = os.waitpid(pid, 0)
+    if status != 0:
+      worker_failed = True
+
+  for tf in tmp_files:
+    try:
+      if not worker_failed:
+        tf.seek(0)
+        raw = tf.read()
+        if raw:
+          w_sc, w_ch, w_un, w_we, w_se = marshal.loads(raw)
+          total_scanned += w_sc
+          all_changed.extend(w_ch)
+          all_unseen.extend(w_un)
+          all_walk_errs.extend(w_we)
+          all_stat_errs.extend(w_se)
+        else:
+          worker_failed = True
+    finally:
+      tf.close()
+
+  if worker_failed:
+    return None
+
+  for err_no, msg, dpath in all_walk_errs:
+    record_walk_error(OSError(err_no, msg, dpath))
+  for err_no, msg, fpath in all_stat_errs:
+    record_read_error(OSError(err_no, msg, fpath), fpath)
+
+  return total_scanned, all_changed, all_unseen
+
+
+def update_index(db, vendors, indexed_paths=frozenset()):
   next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
+  automerge_tuned = False
   scanned = updated = failed = 0
+  pending_delete_pids = []
+  pending_msgs = []
+  pending_refs = []
+  pending_files = []
 
   def record_read_error(exc, path):
     nonlocal failed
@@ -540,24 +936,70 @@ def update_index(db, vendors, indexed_paths=frozenset()):
       sys.exit("ccsi: rebuild could not scan indexed sessions; kept the existing index")
     record_read_error(exc, directory)
 
-  for vendor, path in iter_files(vendors, onerror=record_walk_error):
-    try:
-      st_pre = os.stat(path)
-    except FileNotFoundError:
-      continue
-    except OSError as exc:
-      record_read_error(exc, path)
-      continue
-    unseen.discard(path)
-    scanned += 1
-    prev = known.get(path)
-    if prev is not None and prev[0] == st_pre.st_mtime and prev[1] == st_pre.st_size and prev[3] == st_pre.st_ino:
-      continue
+  parallel_res = None if indexed_paths else _parallel_scan_diff(db, vendors, record_walk_error, record_read_error)
+  if parallel_res is not None:
+    scanned, changed_items, unseen_list = parallel_res
+    had_known = True
+    unseen_dict = {p: None for p in unseen_list}
+  else:
+    known = {
+      path: (mtime, size, ino)
+      for path, mtime, size, ino in db.execute(
+        "SELECT p.path, f.mtime, f.size, f.ino FROM files f CROSS JOIN paths p ON p.path_id = f.path_id"
+      )
+    }
+    had_known = bool(known)
+    known_pop = known.pop
+    changed_items = []
+    for vendor, path, st_pre in iter_files_stat(vendors, onerror=record_walk_error, onstat_error=record_read_error):
+      scanned += 1
+      prev_meta = known_pop(path, None)
+      if prev_meta is not None and prev_meta[0] == st_pre.st_mtime and prev_meta[1] == st_pre.st_size and prev_meta[2] == st_pre.st_ino:
+        continue
+      changed_items.append((vendor, path, st_pre.st_mtime, st_pre.st_size, st_pre.st_ino, prev_meta))
+    unseen_dict = known
+
+  def flush_pending():
+    nonlocal automerge_tuned
+    if not (pending_delete_pids or pending_msgs or pending_refs or pending_files):
+      return
+    if had_known and not automerge_tuned and (pending_delete_pids or pending_msgs):
+      db.execute("INSERT INTO messages(messages, rank) VALUES ('automerge', 16)")
+      automerge_tuned = True
+    if pending_delete_pids:
+      for pid in pending_delete_pids:
+        delete_file_messages(db, pid)
+      pending_delete_pids.clear()
+    if pending_msgs:
+      db.executemany("INSERT INTO messages (rowid, text) VALUES (?, ?)", pending_msgs)
+      pending_msgs.clear()
+    if pending_refs:
+      db.executemany(
+        "INSERT INTO message_refs (mid, path_id, ordinal, ts, role) VALUES (?, ?, ?, ?, ?)",
+        pending_refs,
+      )
+      pending_refs.clear()
+    if pending_files:
+      db.executemany(
+        "INSERT OR REPLACE INTO files (path_id, mtime, size, offset, ino, rows) VALUES (?, ?, ?, ?, ?, ?)",
+        pending_files,
+      )
+      pending_files.clear()
+
+  for vendor, path, pre_mtime, pre_size, pre_ino, prev_meta in changed_items:
+    if prev_meta is not None:
+      prev_extra = db.execute(
+        "SELECT f.offset, f.rows, p.path_id FROM paths p JOIN files f USING (path_id) WHERE p.path = ?",
+        (path,),
+      ).fetchone()
+      prev = (prev_meta[0], prev_meta[1], prev_extra[0], prev_meta[2], prev_extra[1], prev_extra[2]) if prev_extra else None
+    else:
+      prev = None
     can_append = (
       prev is not None
-      and prev[3] == st_pre.st_ino
-      and st_pre.st_size > prev[1]
-      and st_pre.st_mtime >= prev[0]
+      and prev[3] == pre_ino
+      and pre_size > prev[1]
+      and pre_mtime >= prev[0]
       and prev[2] > 0
     )
     start_offset = prev[2] if can_append else 0
@@ -591,8 +1033,8 @@ def update_index(db, vendors, indexed_paths=frozenset()):
       rows = EXTRACTORS[EXTRACTOR_VERSION](path, vendor, records=records)
     except FileNotFoundError:
       scanned -= 1
-      if prev is not None:
-        unseen.add(path)
+      if prev_meta is not None:
+        unseen_dict[path] = prev_meta
       continue
     except OSError as exc:
       record_read_error(exc, path)
@@ -602,26 +1044,20 @@ def update_index(db, vendors, indexed_paths=frozenset()):
     else:
       path_id = prev[5]
       if not can_append:
-        delete_file_messages(db, path_id)
+        pending_delete_pids.append(path_id)
     base_rows = prev[4] if can_append else 0
-    db.executemany(
-      "INSERT INTO messages (rowid, text) VALUES (?, ?)",
-      ((next_mid + i + 1, row[0]) for i, row in enumerate(rows)),
-    )
-    db.executemany(
-      "INSERT INTO message_refs (mid, path_id, ordinal, ts, role) VALUES (?, ?, ?, ?, ?)",
-      ((next_mid + i + 1, path_id, base_rows + i, ts, role) for i, (_, _, ts, role) in enumerate(rows)),
-    )
+    for i, row in enumerate(rows):
+      mid = next_mid + i + 1
+      pending_msgs.append((mid, row[0]))
+      pending_refs.append((mid, path_id, base_rows + i, row[2], row[3]))
     next_mid += len(rows)
-    db.execute(
-      "INSERT OR REPLACE INTO files (path_id, mtime, size, offset, ino, rows) VALUES (?, ?, ?, ?, ?, ?)",
-      (path_id, st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows)),
-    )
-    known[path] = (st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows), path_id)
+    pending_files.append((path_id, st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows)))
     updated += 1
     if updated % 500 == 0:
+      flush_pending()
       db.commit()
-  prune_deleted_files(db, vendors, known, unseen)
+  prune_deleted_files(db, vendors, unseen_dict, unseen_dict)
+  flush_pending()
   db.commit()
   total = db.execute("SELECT coalesce(sum(rows), 0) FROM files").fetchone()[0]
   return scanned, updated, failed, total

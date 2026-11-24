@@ -1448,6 +1448,44 @@ class HardeningChaosTest(unittest.TestCase):
       self.assertIn("backslash.jsonl", run_ccsi(home, "search", "--short-scan", "\\g").stdout)
       self.assertIn("tool.jsonl", run_ccsi(home, "search", "--short-scan", "[j").stdout)
 
+  def test_parallel_scan_large_change_batch_does_not_deadlock(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      projects = home / ".claude" / "projects"
+      # Create >2,000 files across 16 top-level project dirs so _parallel_scan_diff activates,
+      # with long paths so bulk deletion easily exceeds a 64 KB pipe buffer per worker.
+      payload = json.dumps({
+        "type": "user",
+        "timestamp": "2026-11-24T00:00:00Z",
+        "message": {"role": "user", "content": "parallelbatchneedle"},
+      }) + "\n"
+      keep_payload = json.dumps({
+        "type": "user",
+        "timestamp": "2026-11-24T00:01:00Z",
+        "message": {"role": "user", "content": "parallelkeepneedle"},
+      }) + "\n"
+      created = []
+      for d in range(16):
+        pdir = projects / f"long-project-directory-name-padding-segment-{d:02d}"
+        pdir.mkdir(parents=True)
+        for j in range(140):
+          fpath = pdir / f"session-transcript-long-filename-padding-{d:02d}-{j:03d}.jsonl"
+          fpath.write_text(keep_payload if j == 0 else payload)
+          created.append((j, fpath))
+
+      init = run_ccsi(home, "index", timeout=30)
+      self.assertIn("scanned=2240 ", init.stdout)
+
+      # Delete 1,920 files (120 per dir) so each worker returns >64 KB of unseen paths
+      for j, fpath in created:
+        if j >= 20:
+          fpath.unlink()
+
+      inc = run_ccsi(home, "index", timeout=30)
+      self.assertIn("scanned=320 ", inc.stdout)
+      self.assertIn("rows=320 ", inc.stdout)
+      self.assertIn("parallelkeepneedle", run_ccsi(home, "search", "parallelkeepneedle").stdout)
+
   def test_fts5_escaped_quote_phrase_and_punctuation_queries(self):
     with tempfile.TemporaryDirectory() as tmp:
       home = Path(tmp)
