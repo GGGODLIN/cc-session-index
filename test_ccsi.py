@@ -1622,6 +1622,90 @@ class HardeningChaosTest(unittest.TestCase):
           found = ccsi_mod.search_contentless(db, ccsi_mod.extract_rows, args, "targetlargeraceneedle", [])
       self.assertEqual(found, 0)
 
+  def test_streaming_token_and_ts_prefilters_bound_memory_and_handle_chunk_boundaries(self):
+    import tracemalloc
+
+    with tempfile.TemporaryDirectory() as tmp:
+      home = Path(tmp)
+      ccsi_mod = load_ccsi_module()
+
+      # 1. Cross-chunk boundary token detection in file_may_contain_tokens
+      boundary = home / "boundary.jsonl"
+      token = "跨區塊關鍵詞AbCd".translate(ccsi_mod.SQLITE_LIKE_FOLD).encode("utf-8")
+      chunk_sz = 64
+      payload = b"z" * (chunk_sz - len(token) // 2) + "跨區塊關鍵詞ABCD".encode("utf-8") + b"\n"
+      boundary.write_bytes(payload)
+      st_b = boundary.stat()
+      self.assertTrue(
+        ccsi_mod.file_may_contain_tokens(str(boundary), st_b.st_size, st_b.st_ino, [token], chunk_size=chunk_sz)
+      )
+      self.assertFalse(
+        ccsi_mod.file_may_contain_tokens(str(boundary), st_b.st_size, st_b.st_ino, [b"notpresent"], chunk_size=chunk_sz)
+      )
+
+      # 2. >20 MiB modified session file prefiltered with bounded memory (< 24 MiB vs >42 MiB whole-file + lower())
+      session = home / ".claude/projects/probe/huge-stream.jsonl"
+      session.parent.mkdir(parents=True)
+      filler = "一般對話背景文字填充" * 4000  # ~120 KB UTF-8 per line
+      with session.open("w", encoding="utf-8") as fh:
+        fh.write(
+          json.dumps({
+            "type": "user",
+            "timestamp": "2026-10-20T00:00:00Z",
+            "message": {"role": "user", "content": f"uniquelonganchor 記憶檢索 {filler}"},
+          }, ensure_ascii=False) + "\n"
+        )
+        for i in range(1, 180):
+          fh.write(
+            json.dumps({
+              "type": "assistant",
+              "timestamp": f"2026-10-20T00:{i // 60:02d}:{i % 60:02d}Z",
+              "message": {"role": "assistant", "content": filler},
+            }, ensure_ascii=False) + "\n"
+          )
+      run_ccsi(home, "index")
+
+      # Append one byte line after indexing so file is modified (triggers non-unchanged prefilter path)
+      with session.open("a", encoding="utf-8") as fh:
+        fh.write(
+          json.dumps({
+            "type": "user",
+            "timestamp": "2026-10-20T01:00:00Z",
+            "message": {"role": "user", "content": "appended tail"},
+          }) + "\n"
+        )
+      st_huge = session.stat()
+      self.assertGreater(st_huge.st_size, 20 * 1024 * 1024)
+
+      short_tok_bytes = ["記憶".encode("utf-8")]
+      tracemalloc.start()
+      try:
+        may_hit = ccsi_mod.file_may_contain_tokens(
+          str(session), st_huge.st_size - 200, st_huge.st_ino, short_tok_bytes, chunk_size=2 * 1024 * 1024
+        )
+        may_miss = ccsi_mod.file_may_contain_tokens(
+          str(session), st_huge.st_size - 200, st_huge.st_ino, ["不存在詞".encode("utf-8")], chunk_size=2 * 1024 * 1024
+        )
+        with closing(sqlite3.connect(db_path_for(home).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+          pid = db.execute("SELECT path_id FROM paths WHERE path = ?", (str(session),)).fetchone()[0]
+          status_rej, _ = ccsi_mod.resolve_or_prefilter_hit(
+            db, {}, pid, str(session), "cc", 0, "2026-10-20T00:00:00Z", "user",
+            ["別詞"], 0, st_huge.st_size - 200, st_huge.st_ino, 0, full_prefiltered=set(),
+          )
+          status_hit, _ = ccsi_mod.resolve_or_prefilter_hit(
+            db, {}, pid, str(session), "cc", 0, "2026-10-20T00:00:00Z", "user",
+            ["記憶"], 0, st_huge.st_size - 200, st_huge.st_ino, 0, full_prefiltered=set(),
+          )
+        _, peak_bytes = tracemalloc.get_traced_memory()
+      finally:
+        tracemalloc.stop()
+
+      self.assertTrue(may_hit)
+      self.assertFalse(may_miss)
+      self.assertEqual(status_rej, "reject")
+      self.assertEqual(status_hit, "full")
+      self.assertLess(peak_bytes, 16 * 1024 * 1024, f"Prefilter peak memory too high: {peak_bytes / (1024 * 1024):.2f} MiB")
+
 
 if __name__ == "__main__":
   unittest.main()

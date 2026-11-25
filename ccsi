@@ -917,6 +917,7 @@ def update_index(db, vendors, indexed_paths=frozenset()):
   next_mid = db.execute("SELECT coalesce(max(mid), 0) FROM message_refs").fetchone()[0]
   automerge_tuned = False
   scanned = updated = failed = 0
+  pending_chars = 0
   pending_delete_pids = []
   pending_msgs = []
   pending_refs = []
@@ -960,7 +961,7 @@ def update_index(db, vendors, indexed_paths=frozenset()):
     unseen_dict = known
 
   def flush_pending():
-    nonlocal automerge_tuned
+    nonlocal automerge_tuned, pending_chars
     if not (pending_delete_pids or pending_msgs or pending_refs or pending_files):
       return
     if had_known and not automerge_tuned and (pending_delete_pids or pending_msgs):
@@ -985,6 +986,7 @@ def update_index(db, vendors, indexed_paths=frozenset()):
         pending_files,
       )
       pending_files.clear()
+    pending_chars = 0
 
   for vendor, path, pre_mtime, pre_size, pre_ino, prev_meta in changed_items:
     if prev_meta is not None:
@@ -1050,10 +1052,11 @@ def update_index(db, vendors, indexed_paths=frozenset()):
       mid = next_mid + i + 1
       pending_msgs.append((mid, row[0]))
       pending_refs.append((mid, path_id, base_rows + i, row[2], row[3]))
+      pending_chars += len(row[0])
     next_mid += len(rows)
     pending_files.append((path_id, st.st_mtime, st.st_size, new_offset, st.st_ino, base_rows + len(rows)))
     updated += 1
-    if updated % 500 == 0:
+    if updated % 500 == 0 or pending_chars >= 32 * 1024 * 1024:
       flush_pending()
       db.commit()
   prune_deleted_files(db, vendors, unseen_dict, unseen_dict)
@@ -1634,6 +1637,42 @@ def collect_local_context_pread(fd, size, path, vendor, line_start, line_end, be
   return collected_before, collected_after
 
 
+def _scan_ts_lines_pread(fd, size, ts_bytes, chunk_size=1048576):
+  # 分塊逐行抽取含指定時間戳的 JSON 行，避免對數百 MB 變動中對話檔做整檔讀入。
+  matched = []
+  has_unicode_escape = False
+  off = 0
+  carry = b""
+  while off < size:
+    chunk = os.pread(fd, min(chunk_size, size - off), off)
+    if not chunk:
+      return None, False
+    off += len(chunk)
+    data = carry + chunk if carry else chunk
+    if off < size:
+      nl = data.rfind(b"\n")
+      if nl == -1:
+        carry = data
+        continue
+      complete = data[:nl + 1]
+      carry = data[nl + 1:]
+    else:
+      complete = data
+      carry = b""
+    if b"\\u" in complete:
+      has_unicode_escape = True
+    pos = complete.find(ts_bytes, 0)
+    while pos != -1:
+      ls = complete.rfind(b"\n", 0, pos) + 1
+      nl = complete.find(b"\n", pos)
+      le = nl + 1 if nl != -1 else len(complete)
+      obj, valid = parse_json_object(complete[ls:le].decode("utf-8", errors="replace"))
+      if valid and obj is not None:
+        matched.append(obj)
+      pos = complete.find(ts_bytes, le)
+  return matched, has_unicode_escape
+
+
 def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, role, short_tokens, indexed_mtime, indexed_size, indexed_inode, context_count, full_prefiltered=None):
   # Returns ("invalid", None) if source failed identity/open check,
   # ("reject", None) if proven unable to match short_tokens,
@@ -1711,23 +1750,13 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
     if full_prefiltered is not None:
       full_prefiltered.add(path)
     try:
-      buf = pread_exact(fd, st.st_size, 0) if st.st_size > 0 else b""
+      matched, has_unicode_escape = _scan_ts_lines_pread(fd, st.st_size, ts_bytes)
     except OSError:
       return "full", None
-    if buf is None:
+    if matched is None:
       return "full", None
   finally:
     os.close(fd)
-  matched = []
-  pos = buf.find(ts_bytes, 0)
-  while pos != -1:
-    line_start = buf.rfind(b"\n", 0, pos) + 1
-    nl = buf.find(b"\n", pos)
-    line_end = nl + 1 if nl != -1 else len(buf)
-    obj, valid = parse_json_object(buf[line_start:line_end].decode("utf-8", errors="replace"))
-    if valid and obj is not None:
-      matched.append(obj)
-    pos = buf.find(ts_bytes, line_end)
   rows = extract_rows(path, vendor, records=matched) if matched else []
   matching_texts = [text for text, _, source_ts, source_role in rows if (ts, role) == (source_ts, source_role)]
   if any(short_match(text, short_tokens) for text in matching_texts):
@@ -1736,7 +1765,7 @@ def resolve_or_prefilter_hit(db, dup_cache, path_id, path, vendor, ordinal, ts, 
     if len(matching_texts) == expected_tr_count:
       return "reject", None
     return "full", None
-  if not matching_texts or b"\\u" in buf or NUMERIC_TS_RE.match(ts):
+  if not matching_texts or has_unicode_escape or NUMERIC_TS_RE.match(ts):
     return "full", None
   return "reject", None
 
@@ -1898,9 +1927,11 @@ def short_snippet_for(text, tokens, radius=120):
 
 
 SYNTH_TOKEN_BYTES = (b"[", b"]", "\u2014".encode("utf-8"))
+TOKEN_PREFILTER_CHUNK_BYTES = 2 * 1024 * 1024
 
 
-def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list):
+def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list, chunk_size=TOKEN_PREFILTER_CHUNK_BYTES):
+  # \u5206\u584a\u6383\u63cf\u4e26\u4fdd\u7559 max_token_len - 1 \u91cd\u758a\u5340\uff0c\u907f\u514d\u5c0d\u6578\u767e MB \u5c0d\u8a71\u6a94\u505a\u6574\u6a94\u8b80\u5165\u8207\u6574\u4efd lower() \u8907\u88fd\u3002
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
   except OSError:
@@ -1912,19 +1943,51 @@ def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list)
       return False
     if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
       return False
-    buf = pread_exact(fd, st.st_size, 0) if st.st_size > 0 else b""
-    if buf is None:
+    if not token_bytes_list:
+      return True
+    if st.st_size == 0:
       return False
+    if any(any(marker in tok for marker in SYNTH_TOKEN_BYTES) for tok in token_bytes_list):
+      probe = os.pread(fd, 1, st.st_size - 1)
+      return len(probe) == 1
+    need_slash_escape = any(b"\\" in tok or b"/" in tok for tok in token_bytes_list)
+    remaining = [tok for tok in token_bytes_list if tok]
+    if not remaining:
+      return True
+    overlap = max(max(len(tok) for tok in remaining) - 1, 1)
+    carry = b""
+    off = 0
+    while off < st.st_size:
+      try:
+        chunk = os.pread(fd, min(chunk_size, st.st_size - off), off)
+      except OSError:
+        return False
+      if not chunk:
+        return False
+      off += len(chunk)
+      window = carry + chunk if carry else chunk
+      if b"\\u" in window or (need_slash_escape and b"\\" in window):
+        if off < st.st_size:
+          try:
+            if not os.pread(fd, 1, st.st_size - 1):
+              return False
+          except OSError:
+            return False
+        return True
+      low = window.lower()
+      remaining = [tok for tok in remaining if tok not in low]
+      if not remaining:
+        if off < st.st_size:
+          try:
+            if not os.pread(fd, 1, st.st_size - 1):
+              return False
+          except OSError:
+            return False
+        return True
+      carry = window[-overlap:]
+    return False
   finally:
     os.close(fd)
-  if b"\\u" in buf:
-    return True
-  if any(any(marker in tok for marker in SYNTH_TOKEN_BYTES) for tok in token_bytes_list):
-    return True
-  if b"\\" in buf and any(b"\\" in tok or b"/" in tok for tok in token_bytes_list):
-    return True
-  low = buf.lower()
-  return all(tok in low for tok in token_bytes_list)
 
 
 def search_short_scan_legacy(db, args, short_tokens):
