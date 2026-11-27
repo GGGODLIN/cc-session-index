@@ -144,9 +144,10 @@ def iter_files(vendors, onerror=None):
       # Prune mirrored Codex rollouts under <cc_root>/codex so they are not indexed twice.
       if vendor == "cc" and dirpath == root and "codex" in dirs:
         dirs.remove("codex")
+      prefix = dirpath if dirpath.endswith(os.sep) else dirpath + os.sep
       for n in names:
         if n.endswith(".jsonl"):
-          yield vendor, os.path.join(dirpath, n)
+          yield vendor, prefix + n
 
 
 _USE_DIR_FD = (os.stat in os.supports_dir_fd) and hasattr(os, "O_DIRECTORY")
@@ -302,9 +303,28 @@ def read_jsonl_records(path, start_offset=0, indexed_identity=None, append_valid
   return st, consumed, records
 
 
-def load_lines(path):
-  _, _, records = read_jsonl_records(path, 0, nonblock=True)
-  yield from records
+def load_lines(path, since="", tool_only=False, indexed_identity=None):
+  with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as f:
+    st = os.fstat(f.fileno())
+    if indexed_identity is not None:
+      indexed_size, indexed_inode = indexed_identity
+      if not stat.S_ISREG(st.st_mode) or st.st_ino != indexed_inode or st.st_size < indexed_size:
+        return
+    elif not stat.S_ISREG(st.st_mode):
+      raise OSError(errno.EINVAL, "not a regular file", path)
+    remaining = st.st_size
+    while remaining > 0:
+      raw = f.readline(remaining)
+      if not raw:
+        break
+      remaining -= len(raw)
+      if tool_only and b'"tool_use"' not in raw and b"\\u" not in raw:
+        continue
+      obj, valid = parse_json_object(raw.decode("utf-8", errors="replace"))
+      if obj is not None:
+        yield obj
+      elif not valid and not raw.endswith(b"\n"):
+        break
 
 
 def as_text(value):
@@ -386,20 +406,23 @@ def codex_text(content):
   return ""
 
 
-def events_cc(path, records=None, include_input=False):
+def events_cc(path, records=None, include_input=False, since="", tool_only=False):
   session = os.path.splitext(os.path.basename(path))[0]
-  for obj in (records if records is not None else load_lines(path)):
+  for obj in (records if records is not None else load_lines(path, since, tool_only)):
     if obj.get("type") not in (None, "user", "assistant"):
       continue
     msg = obj.get("message")
     if not isinstance(msg, dict):
+      continue
+    ts = as_text(obj.get("timestamp", ""))
+    if since and ts and ts[:10] < since:
       continue
     is_meta = bool(obj.get("isMeta") or msg.get("isMeta"))
     origin = obj.get("origin") if isinstance(obj.get("origin"), dict) else {}
     raw_role = as_text(msg.get("role", obj.get("type")))
     if obj.get("isCompactSummary") or origin.get("kind") == "task-notification":
       raw_role = "system"
-    base = {"vendor": "cc", "session": obj.get("sessionId") or session, "path": path, "ts": as_text(obj.get("timestamp", "")), "cwd": as_text(obj.get("cwd", "")), "role": raw_role, "model": as_text(msg.get("model", ""))}
+    base = {"vendor": "cc", "session": obj.get("sessionId") or session, "path": path, "ts": ts, "cwd": as_text(obj.get("cwd", "")), "role": raw_role, "model": as_text(msg.get("model", ""))}
     for kind, text, extra in cc_blocks(msg.get("content")):
       if kind == "text" and (is_meta or not text.strip()):
         continue
@@ -534,8 +557,10 @@ PARSERS = {
 }
 
 
-def events_for(vendor, path, records=None, include_input=False):
+def events_for(vendor, path, records=None, include_input=False, since="", tool_only=False):
   parser = PARSERS.get(vendor, events_codex)
+  if vendor == "cc" and (since or tool_only):
+    return parser(path, records=records, include_input=include_input, since=since, tool_only=tool_only)
   return parser(path, records=records, include_input=include_input)
 
 
@@ -1434,11 +1459,18 @@ def short_match(text, tokens):
 
 
 def read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode):
+  identity = (indexed_size, indexed_inode)
+  if extractor is not extract_rows:
+    try:
+      _, _, records = read_jsonl_records(path, indexed_identity=identity)
+    except OSError:
+      return []
+    return extractor(path, vendor, records=records)
   try:
-    _, _, records = read_jsonl_records(path, indexed_identity=(indexed_size, indexed_inode))
+    with closing(load_lines(path, indexed_identity=identity)) as records:
+      return extractor(path, vendor, records=records)
   except OSError:
     return []
-  return extractor(path, vendor, records=records)
 
 
 def probe_ts_pread(fd, size, offset):
@@ -1930,8 +1962,20 @@ SYNTH_TOKEN_BYTES = (b"[", b"]", "\u2014".encode("utf-8"))
 TOKEN_PREFILTER_CHUNK_BYTES = 2 * 1024 * 1024
 
 
-def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list, chunk_size=TOKEN_PREFILTER_CHUNK_BYTES):
-  # \u5206\u584a\u6383\u63cf\u4e26\u4fdd\u7559 max_token_len - 1 \u91cd\u758a\u5340\uff0c\u907f\u514d\u5c0d\u6578\u767e MB \u5c0d\u8a71\u6a94\u505a\u6574\u6a94\u8b80\u5165\u8207\u6574\u4efd lower() \u8907\u88fd\u3002
+def non_ascii_token_pattern(token):
+  # An uninterrupted non-ASCII token must come from source text. Exclude the
+  # synthesized em dash and the replacement character produced by UTF-8 decoding.
+  if not token or any(ch.isascii() or ch in "\u2014\ufffd" for ch in token):
+    return None
+  parts = []
+  for ch in token:
+    escaped = json.dumps(ch, ensure_ascii=True)[1:-1].encode("ascii")
+    parts.append(b"(?:" + re.escape(ch.encode("utf-8")) + b"|" + re.escape(escaped) + b")")
+  return re.compile(b"".join(parts), re.IGNORECASE)
+
+
+def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list, chunk_size=TOKEN_PREFILTER_CHUNK_BYTES, escaped_token=None):
+  # \u5206\u584a\u6383\u63cf\u4e26\u4fdd\u7559\u91cd\u758a\u5340\uff0c\u907f\u514d\u5c0d\u6578\u767e MB \u5c0d\u8a71\u6a94\u505a\u6574\u6a94\u8b80\u5165\u8207\u6574\u4efd lower() \u8907\u88fd\u3002
   try:
     fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
   except OSError:
@@ -1955,6 +1999,12 @@ def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list,
     if not remaining:
       return True
     overlap = max(max(len(tok) for tok in remaining) - 1, 1)
+    if escaped_token is not None:
+      literal, pattern = escaped_token
+      # A supplementary code point may occupy two six-byte JSON escapes.
+      overlap = max(overlap, len(literal.decode("utf-8")) * 12 - 1)
+    saw_escape = False
+    escaped_matched = False
     carry = b""
     off = 0
     while off < st.st_size:
@@ -1966,17 +2016,29 @@ def file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list,
         return False
       off += len(chunk)
       window = carry + chunk if carry else chunk
-      if b"\\u" in window or (need_slash_escape and b"\\" in window):
-        if off < st.st_size:
-          try:
-            if not os.pread(fd, 1, st.st_size - 1):
-              return False
-          except OSError:
-            return False
-        return True
-      low = window.lower()
-      remaining = [tok for tok in remaining if tok not in low]
-      if not remaining:
+      has_escape = (b"\\u" in window) or (need_slash_escape and b"\\" in window)
+      if has_escape:
+        saw_escape = True
+        if escaped_token is None:
+          possible = True
+        else:
+          if not escaped_matched and (literal in window or pattern.search(window) is not None):
+            escaped_matched = True
+          possible = escaped_matched
+      elif saw_escape:
+        if escaped_token is not None:
+          if not escaped_matched and literal in window:
+            escaped_matched = True
+          possible = escaped_matched
+        else:
+          possible = True
+      else:
+        low = window.lower()
+        remaining = [tok for tok in remaining if tok not in low]
+        if escaped_token is not None and not escaped_matched and literal in window:
+          escaped_matched = True
+        possible = not remaining
+      if possible:
         if off < st.st_size:
           try:
             if not os.pread(fd, 1, st.st_size - 1):
@@ -2031,9 +2093,16 @@ def search_short_scan_contentless(db, extractor, args, short_tokens):
     t.translate(SQLITE_LIKE_FOLD).encode("utf-8")
     for t in short_tokens
   ]
+  escaped_token = None
+  if extractor is extract_rows:
+    for token, raw in zip(short_tokens, token_bytes_list):
+      pattern = non_ascii_token_pattern(token)
+      if pattern is not None:
+        escaped_token = (raw, pattern)
+        break
   found = 0
   for path, vendor, indexed_size, indexed_inode in db.execute(sql, params):
-    if not file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list):
+    if not file_may_contain_tokens(path, indexed_size, indexed_inode, token_bytes_list, escaped_token=escaped_token):
       continue
     rows = read_hit_rows(extractor, path, vendor, indexed_size, indexed_inode)
     for ordinal in range(len(rows) - 1, -1, -1):
@@ -2121,6 +2190,7 @@ def cmd_search(args):
 def cmd_events(args):
   since = args.since or ""
   kinds = set(args.kind) if args.kind else None
+  tool_only = bool(args.tool) or kinds == {"tool_call"}
   out = sys.stdout
   for vendor, p in iter_files(set(args.vendor or VENDORS)):
     if args.session and args.session not in os.path.basename(p):
@@ -2132,7 +2202,7 @@ def cmd_events(args):
       except OSError:
         continue
     try:
-      for ev in events_for(vendor, p):
+      for ev in events_for(vendor, p, since=since, tool_only=tool_only):
         if since and ev["ts"] and ev["ts"][:10] < since:
           continue
         if kinds and ev["kind"] not in kinds:

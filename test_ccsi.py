@@ -1706,6 +1706,70 @@ class HardeningChaosTest(unittest.TestCase):
       self.assertEqual(status_hit, "full")
       self.assertLess(peak_bytes, 16 * 1024 * 1024, f"Prefilter peak memory too high: {peak_bytes / (1024 * 1024):.2f} MiB")
 
+  def test_short_scan_prefilter_checks_all_tokens_without_unicode_escape_and_matches_escaped_cjk(self):
+    # Regression for Wave 40 BF1 M2: without \u, non-ASCII + ASCII short-scan must still reject
+    # files missing the ASCII token; with \u escapes, escaped non-ASCII token must match.
+    ccsi_mod = load_ccsi_module()
+    with tempfile.TemporaryDirectory() as td:
+      p_plain = Path(td) / "plain.jsonl"
+      p_plain.write_text('{"type":"user","timestamp":"2026-11-26T10:00:00.000Z","message":{"role":"user","content":"測試資料"}}\n', encoding="utf-8")
+      st_plain = p_plain.stat()
+      pat = ccsi_mod.non_ascii_token_pattern("測試")
+      self.assertIsNotNone(pat)
+      escaped_tok = ("測試".encode("utf-8"), pat)
+      # Has "測試" but lacks "ab" and has no \u -> must reject
+      self.assertFalse(ccsi_mod.file_may_contain_tokens(
+        str(p_plain), st_plain.st_size, st_plain.st_ino,
+        ["測試".encode("utf-8"), b"ab"], escaped_token=escaped_tok,
+      ))
+      # Escaped CJK with \uXXXX must match
+      p_esc = Path(td) / "esc.jsonl"
+      p_esc.write_text(json.dumps({"type": "user", "timestamp": "2026-11-26T10:00:00.000Z", "message": {"role": "user", "content": "測試 ab"}}, ensure_ascii=True) + "\n", encoding="utf-8")
+      st_esc = p_esc.stat()
+      self.assertTrue(ccsi_mod.file_may_contain_tokens(
+        str(p_esc), st_esc.st_size, st_esc.st_ino,
+        ["測試".encode("utf-8"), b"ab"], escaped_token=escaped_tok,
+      ))
+      # Escaped CJK without the target non-ASCII token must reject even when \u is present
+      p_other_esc = Path(td) / "other_esc.jsonl"
+      p_other_esc.write_text(json.dumps({"type": "user", "timestamp": "2026-11-26T10:00:00.000Z", "message": {"role": "user", "content": "其他文字"}}, ensure_ascii=True) + "\n", encoding="utf-8")
+      st_other = p_other_esc.stat()
+      self.assertFalse(ccsi_mod.file_may_contain_tokens(
+        str(p_other_esc), st_other.st_size, st_other.st_ino,
+        ["測試".encode("utf-8")], escaped_token=escaped_tok,
+      ))
+
+  def test_events_since_and_tool_filter_real_cc_key_order_and_streaming(self):
+    # Regression for Wave 40 BF1 M1: real CC lines place timestamp near the end (often followed
+    # by toolUseResult) and must preserve exact since/tool filtering with bounded streaming memory.
+    with tempfile.TemporaryDirectory() as td:
+      home = Path(td)
+      proj = home / ".claude/projects/-proj"
+      proj.mkdir(parents=True)
+      session = proj / "real-shape.jsonl"
+      old_line = json.dumps({
+        "parentUuid": "p0",
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t0", "name": "Bash", "input": {"command": "echo old"}}]},
+        "uuid": "u0",
+        "timestamp": "2026-11-20T09:00:00.000Z",
+        "toolUseResult": {"ok": True},
+      })
+      new_line = json.dumps({
+        "parentUuid": "p1",
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo new"}}]},
+        "uuid": "u1",
+        "timestamp": "2026-11-26T09:00:00.000Z",
+        "toolUseResult": {"ok": True},
+      })
+      session.write_text(old_line + "\n" + new_line + "\n", encoding="utf-8")
+      res = run_ccsi(home, "events", "--since", "2026-11-25", "--kind", "tool_call", "--tool", "Bash")
+      rows = [json.loads(line) for line in res.stdout.splitlines() if line.strip()]
+      self.assertEqual(len(rows), 1)
+      self.assertEqual(rows[0]["ts"], "2026-11-26T09:00:00.000Z")
+      self.assertEqual(rows[0]["text"], "echo new")
+
 
 if __name__ == "__main__":
   unittest.main()
