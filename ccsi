@@ -7,6 +7,7 @@ import marshal
 import math
 import os
 import re
+import signal
 import sqlite3
 import stat
 import sys
@@ -136,14 +137,19 @@ def vendor_of(path):
   return "cc", ROOT
 
 
-def iter_files(vendors, onerror=None):
+def iter_files(vendors, onerror=None, *, exclude_subagents=False):
+  subagents_seg = os.sep + "subagents" + os.sep
   for vendor, root in ROOTS:
     if vendor not in vendors or not os.path.isdir(root):
+      continue
+    if exclude_subagents and subagents_seg in (root if root.endswith(os.sep) else root + os.sep):
       continue
     for dirpath, dirs, names in os.walk(root, onerror=onerror):
       # Prune mirrored Codex rollouts under <cc_root>/codex so they are not indexed twice.
       if vendor == "cc" and dirpath == root and "codex" in dirs:
         dirs.remove("codex")
+      if exclude_subagents and "subagents" in dirs:
+        dirs.remove("subagents")
       prefix = dirpath if dirpath.endswith(os.sep) else dirpath + os.sep
       for n in names:
         if n.endswith(".jsonl"):
@@ -375,27 +381,34 @@ def normalize_fts_text(text):
   return s
 
 
-def cc_blocks(content):
+def cc_blocks(content, kinds=None):
   if isinstance(content, str):
-    yield ("text", content, None)
+    if kinds is None or "text" in kinds:
+      yield ("text", content, None)
     return
   if not isinstance(content, list):
     return
+  want_text = kinds is None or "text" in kinds
+  want_tool_call = kinds is None or "tool_call" in kinds
+  want_tool_result = kinds is None or "tool_result" in kinds
   for block in content:
     if not isinstance(block, dict):
       continue
     btype = block.get("type")
     if btype == "text":
-      yield ("text", as_text(block.get("text", "")), None)
+      if want_text:
+        yield ("text", as_text(block.get("text", "")), None)
     elif btype == "tool_use":
-      inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-      tname = as_text(block.get("name", ""))
-      cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or summarize_tool_input(tname, inp)
-      yield ("tool_call", as_text(cmd), {"tool": tname, "input": inp})
+      if want_tool_call:
+        inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+        tname = as_text(block.get("name", ""))
+        cmd = inp.get("command") or inp.get("prompt") or inp.get("query") or summarize_tool_input(tname, inp)
+        yield ("tool_call", as_text(cmd), {"tool": tname, "input": inp})
     elif btype == "tool_result":
-      c = block.get("content")
-      text = c if isinstance(c, str) else " ".join(as_text(x.get("text", "")) for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
-      yield ("tool_result", as_text(text), None)
+      if want_tool_result:
+        c = block.get("content")
+        text = c if isinstance(c, str) else " ".join(as_text(x.get("text", "")) for x in c if isinstance(x, dict)) if isinstance(c, list) else ""
+        yield ("tool_result", as_text(text), None)
 
 
 def codex_text(content):
@@ -406,9 +419,156 @@ def codex_text(content):
   return ""
 
 
-def events_cc(path, records=None, include_input=False, since="", tool_only=False):
+CC_MSG_NONSTR_CONTENT_RE = re.compile(
+  rb'"message"\s*:\s*\{(?:\s*"(?:[^"\\]|\\.)*"\s*:\s*(?:"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*,)*\s*"content"\s*:\s*[\[\{ntf0-9-]'
+)
+_CC_MSG_USER_LIST_FAST = (
+  b'"message":{"role":"user","content":[',
+  b'"message": {"role": "user", "content": [',
+)
+_CC_MSG_USER_STR_FAST = (
+  b'"message":{"role":"user","content":"',
+  b'"message": {"role": "user", "content": "',
+)
+CC_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+def _cc_role_needles(roles):
+  # Only prefilter by JSON string suffix `<role>"` when no non-string JSON value or
+  # synthesized "system" role can match as_text(msg.get("role", obj.get("type"))).
+  if not roles:
+    return None
+  if any((not r.isalpha()) or r in ("true", "false", "null", "system") for r in roles):
+    return None
+  return tuple(r.encode("utf-8") + b'"' for r in roles)
+
+
+def _iter_cc_lines(path, tool_only=False, text_only=False, roles=None):
+  role_needles = _cc_role_needles(roles)
+  if tool_only:
+    primary = b'tool_use"'
+  elif role_needles and len(role_needles) == 1:
+    primary = role_needles[0]
+  else:
+    primary = b'"message"'
+  need_msg_check = primary != b'"message"'
+  extra_roles = role_needles if (role_needles and len(role_needles) > 1) else None
+  match_nonstr = CC_MSG_NONSTR_CONTENT_RE.match if text_only else None
+  list_fast_0, list_fast_1 = _CC_MSG_USER_LIST_FAST
+  str_fast_0, str_fast_1 = _CC_MSG_USER_STR_FAST
+  loads = json.loads
+  decode_err = json.JSONDecodeError
+
+  fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+  try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+      raise OSError(errno.EINVAL, "not a regular file", path)
+    remaining = st.st_size
+    if remaining <= 0:
+      return
+    # Accumulate multi-chunk lines in a list to avoid O(k^2) bytes concatenation.
+    carry_parts = []
+    while remaining > 0 or carry_parts:
+      if remaining > 0:
+        chunk = os.read(fd, CC_STREAM_CHUNK_BYTES if remaining > CC_STREAM_CHUNK_BYTES else remaining)
+        if not chunk:
+          remaining = 0
+          if not carry_parts:
+            break
+          complete = carry_parts[0] if len(carry_parts) == 1 else b"".join(carry_parts)
+          carry_parts.clear()
+        else:
+          remaining -= len(chunk)
+          if remaining > 0:
+            nl_last = chunk.rfind(b"\n")
+            if nl_last == -1:
+              carry_parts.append(chunk)
+              continue
+            if carry_parts:
+              carry_parts.append(chunk[:nl_last + 1])
+              complete = b"".join(carry_parts)
+              carry_parts.clear()
+            else:
+              complete = chunk if nl_last == len(chunk) - 1 else chunk[:nl_last + 1]
+            if nl_last < len(chunk) - 1:
+              carry_parts.append(chunk[nl_last + 1:])
+          else:
+            if carry_parts:
+              carry_parts.append(chunk)
+              complete = b"".join(carry_parts)
+              carry_parts.clear()
+            else:
+              complete = chunk
+      else:
+        complete = carry_parts[0] if len(carry_parts) == 1 else b"".join(carry_parts)
+        carry_parts.clear()
+
+      n = len(complete)
+      find = complete.find
+      rfind = complete.rfind
+      startswith = complete.startswith
+      pos = 0
+      idx1 = find(primary, 0)
+      idx2 = find(b"\\u", 0)
+      while pos < n:
+        if idx1 != -1 and idx1 < pos:
+          idx1 = find(primary, pos)
+        if idx2 != -1 and idx2 < pos:
+          idx2 = find(b"\\u", pos)
+        if idx1 == -1:
+          if idx2 == -1:
+            break
+          idx = idx2
+          from_u = True
+        elif idx2 == -1 or idx1 <= idx2:
+          idx = idx1
+          from_u = False
+        else:
+          idx = idx2
+          from_u = True
+        nl = find(b"\n", idx)
+        le = nl if nl != -1 else n
+        ls = rfind(b"\n", pos, idx)
+        ls = ls + 1 if ls != -1 else pos
+        pos = le + 1 if nl != -1 else n
+        has_u = from_u or (idx2 != -1 and idx2 < le)
+        if not has_u:
+          if need_msg_check:
+            mpos = find(b'"message"', ls, le)
+            if mpos == -1:
+              continue
+          else:
+            mpos = idx
+          if extra_roles is not None and not any(find(rn, ls, le) != -1 for rn in extra_roles):
+            continue
+          if match_nonstr is not None and (mpos == ls or complete[mpos - 1] != 92):
+            if startswith(list_fast_0, mpos) or startswith(list_fast_1, mpos):
+              if find(b'"message"', mpos + 9, le) == -1 and find(b'text"', mpos + 9, le) == -1:
+                continue
+            elif not (startswith(str_fast_0, mpos) or startswith(str_fast_1, mpos)):
+              if match_nonstr(complete, mpos, le) is not None:
+                if find(b'"message"', mpos + 9, le) == -1 and find(b'text"', mpos + 9, le) == -1:
+                  continue
+        try:
+          obj = loads(complete[ls:le].decode("utf-8", errors="replace"))
+        except (decode_err, RecursionError):
+          if nl == -1:
+            break
+          continue
+        if isinstance(obj, dict):
+          yield obj
+  finally:
+    os.close(fd)
+
+
+def events_cc(path, records=None, include_input=False, since="", tool_only=False, kinds=None, roles=None):
   session = os.path.splitext(os.path.basename(path))[0]
-  for obj in (records if records is not None else load_lines(path, since, tool_only)):
+  text_only = kinds == {"text"}
+  line_iter = records if records is not None else _iter_cc_lines(
+    path, tool_only=tool_only, text_only=text_only, roles=roles,
+  )
+  for obj in line_iter:
     if obj.get("type") not in (None, "user", "assistant"):
       continue
     msg = obj.get("message")
@@ -422,10 +582,16 @@ def events_cc(path, records=None, include_input=False, since="", tool_only=False
     raw_role = as_text(msg.get("role", obj.get("type")))
     if obj.get("isCompactSummary") or origin.get("kind") == "task-notification":
       raw_role = "system"
-    base = {"vendor": "cc", "session": obj.get("sessionId") or session, "path": path, "ts": ts, "cwd": as_text(obj.get("cwd", "")), "role": raw_role, "model": as_text(msg.get("model", ""))}
-    for kind, text, extra in cc_blocks(msg.get("content")):
+    if roles and raw_role not in roles:
+      continue
+    if kinds == {"text"} and is_meta:
+      continue
+    base = None
+    for kind, text, extra in cc_blocks(msg.get("content"), kinds=kinds):
       if kind == "text" and (is_meta or not text.strip()):
         continue
+      if base is None:
+        base = {"vendor": "cc", "session": obj.get("sessionId") or session, "path": path, "ts": ts, "cwd": as_text(obj.get("cwd", "")), "role": raw_role, "model": as_text(msg.get("model", ""))}
       ev = dict(base, kind=kind, text=text[:8000])
       if extra:
         ev["tool"] = extra["tool"]
@@ -557,10 +723,10 @@ PARSERS = {
 }
 
 
-def events_for(vendor, path, records=None, include_input=False, since="", tool_only=False):
+def events_for(vendor, path, records=None, include_input=False, since="", tool_only=False, kinds=None, roles=None):
   parser = PARSERS.get(vendor, events_codex)
-  if vendor == "cc" and (since or tool_only):
-    return parser(path, records=records, include_input=include_input, since=since, tool_only=tool_only)
+  if vendor == "cc" and (since or tool_only or kinds is not None or roles is not None):
+    return parser(path, records=records, include_input=include_input, since=since, tool_only=tool_only, kinds=kinds, roles=roles)
   return parser(path, records=records, include_input=include_input)
 
 
@@ -2187,32 +2353,213 @@ def cmd_search(args):
     print("(no hits)")
 
 
-def cmd_events(args):
-  since = args.since or ""
-  kinds = set(args.kind) if args.kind else None
-  tool_only = bool(args.tool) or kinds == {"tool_call"}
-  out = sys.stdout
-  for vendor, p in iter_files(set(args.vendor or VENDORS)):
-    if args.session and args.session not in os.path.basename(p):
-      continue
-    if since:
-      try:
-        if time.strftime("%Y-%m-%d", time.localtime(os.stat(p).st_mtime)) < since:
-          continue
-      except OSError:
-        continue
+_EVENTS_PARALLEL_MIN_FILES = 8
+_EVENTS_PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+_EVENTS_WRITE_BUF_BYTES = 65536
+
+
+def _write_all_fd(fd, data):
+  mv = memoryview(data)
+  written = 0
+  total = len(mv)
+  while written < total:
+    written += os.write(fd, mv[written:])
+
+
+def _emit_events_files(files, write_bytes, since, kinds, roles, tool_only, tool_name):
+  dumps = json.dumps
+  buf = []
+  buf_len = 0
+  for vendor, p, _sz in files:
     try:
-      for ev in events_for(vendor, p, since=since, tool_only=tool_only):
+      for ev in events_for(vendor, p, since=since, tool_only=tool_only, kinds=kinds, roles=roles):
         if since and ev["ts"] and ev["ts"][:10] < since:
           continue
         if kinds and ev["kind"] not in kinds:
           continue
-        if args.tool and (ev["kind"] != "tool_call" or ev.get("tool") != args.tool):
+        if roles and ev["role"] not in roles:
           continue
-        out.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        if tool_name and (ev["kind"] != "tool_call" or ev.get("tool") != tool_name):
+          continue
+        line = (dumps(ev, ensure_ascii=False) + "\n").encode("utf-8")
+        buf.append(line)
+        buf_len += len(line)
+        if buf_len >= _EVENTS_WRITE_BUF_BYTES:
+          write_bytes(b"".join(buf))
+          buf.clear()
+          buf_len = 0
     except OSError as e:
-      print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
+      if isinstance(e, BrokenPipeError):
+        raise
+      sys.stderr.write(f"skip unreadable file: {p}: {e}\n")
       continue
+  if buf:
+    write_bytes(b"".join(buf))
+    buf.clear()
+
+
+def _partition_files_by_size(files, n_workers):
+  # Contiguous byte-balanced slices preserve exact file output ordering.
+  total = sum(sz for _, _, sz in files)
+  chunks = []
+  n = len(files)
+  start = 0
+  acc = 0
+  for i in range(1, n_workers):
+    target = (total * i) // n_workers
+    end = start
+    while end < n - (n_workers - i) and (end == start or acc < target):
+      acc += files[end][2]
+      end += 1
+    chunks.append(files[start:end])
+    start = end
+  chunks.append(files[start:])
+  return [c for c in chunks if c]
+
+
+def _terminate_and_reap(pids):
+  for pid in pids:
+    if pid is None:
+      continue
+    try:
+      wpid, _ = os.waitpid(pid, os.WNOHANG)
+      if wpid == 0:
+        try:
+          os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+          pass
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+      pass
+
+
+def _run_events_parallel(files, total_bytes, out_buf, since, kinds, roles, tool_only, tool_name):
+  n_workers = min(os.cpu_count() or 1, 4, len(files) // 2)
+  if n_workers < 2:
+    return False
+  chunks = _partition_files_by_size(files, n_workers)
+  if len(chunks) < 2:
+    return False
+  sys.stdout.flush()
+  sys.stderr.flush()
+  tmp_files = []
+  pids = []
+  fork_failed = False
+  for i in range(1, len(chunks)):
+    tf = tempfile.TemporaryFile()
+    w_fd = tf.fileno()
+    try:
+      pid = os.fork()
+    except OSError:
+      tf.close()
+      fork_failed = True
+      break
+    if pid == 0:
+      rc = 1
+      try:
+        for prev_tf in tmp_files:
+          try:
+            prev_tf.close()
+          except OSError:
+            pass
+        _emit_events_files(
+          chunks[i],
+          lambda data, fd=w_fd: _write_all_fd(fd, data),
+          since, kinds, roles, tool_only, tool_name,
+        )
+        sys.stderr.flush()
+        rc = 0
+      except BaseException:
+        rc = 1
+      finally:
+        os._exit(rc)
+    else:
+      tmp_files.append(tf)
+      pids.append(pid)
+
+  if fork_failed:
+    _terminate_and_reap(pids)
+    for tf in tmp_files:
+      tf.close()
+    return False
+
+  failed = False
+  try:
+    _emit_events_files(chunks[0], out_buf.write, since, kinds, roles, tool_only, tool_name)
+    out_buf.flush()
+    for idx, (pid, tf) in enumerate(zip(pids, tmp_files)):
+      _, status = os.waitpid(pid, 0)
+      pids[idx] = None
+      if status != 0:
+        failed = True
+      if not failed:
+        tf.seek(0)
+        while True:
+          block = tf.read(1048576)
+          if not block:
+            break
+          out_buf.write(block)
+        out_buf.flush()
+      tf.close()
+  except BaseException:
+    _terminate_and_reap(pids)
+    for tf in tmp_files:
+      try:
+        tf.close()
+      except OSError:
+        pass
+    raise
+  if failed:
+    sys.exit(1)
+  return True
+
+
+def cmd_events(args):
+  since = args.since or ""
+  kinds = set(args.kind) if args.kind else None
+  roles = set(args.role) if args.role else None
+  exclude_subagents = bool(args.exclude_subagents)
+  tool_only = bool(args.tool) or kinds == {"tool_call"}
+  out = sys.stdout
+  out_buf = getattr(out, "buffer", None)
+  files = []
+  total_bytes = 0
+  for vendor, p in iter_files(set(args.vendor or VENDORS), exclude_subagents=exclude_subagents):
+    if args.session and args.session not in os.path.basename(p):
+      continue
+    try:
+      st = os.stat(p)
+    except OSError as e:
+      if not since:
+        print(f"skip unreadable file: {p}: {e}", file=sys.stderr)
+      continue
+    if since and time.strftime("%Y-%m-%d", time.localtime(st.st_mtime)) < since:
+      continue
+    files.append((vendor, p, st.st_size))
+    total_bytes += st.st_size
+
+  # Restrict parallel TMPDIR spooling to filtered queries so unfiltered `ccsi events | head`
+  # keeps immediate zero-spool streaming behavior.
+  use_parallel = bool(roles or kinds or args.tool)
+  if (
+    use_parallel
+    and out_buf is not None
+    and hasattr(os, "fork")
+    and len(files) >= _EVENTS_PARALLEL_MIN_FILES
+    and total_bytes >= _EVENTS_PARALLEL_MIN_BYTES
+  ):
+    if _run_events_parallel(files, total_bytes, out_buf, since, kinds, roles, tool_only, args.tool):
+      return
+
+  if out_buf is not None:
+    _emit_events_files(files, out_buf.write, since, kinds, roles, tool_only, args.tool)
+    out_buf.flush()
+  else:
+    _emit_events_files(
+      files,
+      lambda data: out.write(data.decode("utf-8")),
+      since, kinds, roles, tool_only, args.tool,
+    )
 
 
 def main():
@@ -2236,6 +2583,8 @@ def main():
   p_events.add_argument("--since", help="YYYY-MM-DD; skip files older than this and events before it")
   p_events.add_argument("--session", help="substring of the session file name")
   p_events.add_argument("--kind", action="append", choices=("text", "tool_call", "tool_result", "session_meta", "turn_context"))
+  p_events.add_argument("--role", action="append", help="only events matching this role (e.g. user, assistant)")
+  p_events.add_argument("--exclude-subagents", action="store_true", help="skip subagents directories and transcripts")
   p_events.add_argument("--tool", help="only tool_call events for this tool name")
   p_events.set_defaults(fn=cmd_events)
   args = ap.parse_args()

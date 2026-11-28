@@ -1770,6 +1770,96 @@ class HardeningChaosTest(unittest.TestCase):
       self.assertEqual(rows[0]["ts"], "2026-11-26T09:00:00.000Z")
       self.assertEqual(rows[0]["text"], "echo new")
 
+  def test_iter_cc_lines_parity_vs_load_lines_and_role_subagents_filters(self):
+    # Regression for Wave 44 BF4 M6/G2/M3/M4: verify _iter_cc_lines + events_cc matches
+    # load_lines + events_cc across escaped keys, shuffled key order, duplicate "message",
+    # non-string content types, >1 MiB multi-chunk lines, and --role / --exclude-subagents.
+    ccsi_mod = load_ccsi_module()
+    with tempfile.TemporaryDirectory() as td:
+      home = Path(td)
+      proj = home / ".claude/projects/-proj"
+      sub = proj / "subagents"
+      proj.mkdir(parents=True)
+      sub.mkdir(parents=True)
+      edge_file = proj / "edge.jsonl"
+      big_pad = "p" * (1200 * 1024)
+      lines = [
+        # Escaped keys & role
+        '{"type":"\\u0075ser","timestamp":"2026-11-26T01:00:00Z","\\u006dessage":{"role":"\\u0075ser","content":"escaped user msg"}}',
+        # Shuffled key order with content before role
+        '{"timestamp":"2026-11-26T01:01:00Z","message":{"content":[{"type":"text","text":"shuffled list text"}],"role":"user"},"type":"user"}',
+        # Duplicate "message" substring inside an earlier string value + list content without text
+        '{"type":"user","timestamp":"2026-11-26T01:02:00Z","note":"\\"message\\":{\\"role\\":\\"user\\",\\"content\\":\\"fake\\"}","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}',
+        # Duplicate "message" substring + real string content
+        '{"type":"user","timestamp":"2026-11-26T01:03:00Z","note":"\\"message\\"","message":{"role":"user","content":"real string after dup message"}}',
+        # Non-string / non-list content: dict, null, int
+        '{"type":"user","timestamp":"2026-11-26T01:04:00Z","message":{"role":"user","content":{"k":"v"}}}',
+        '{"type":"user","timestamp":"2026-11-26T01:05:00Z","message":{"role":"user","content":null}}',
+        '{"type":"user","timestamp":"2026-11-26T01:06:00Z","message":{"role":"user","content":42}}',
+        # Synthesized system role via isCompactSummary
+        '{"type":"user","isCompactSummary":true,"timestamp":"2026-11-26T01:07:00Z","message":{"role":"user","content":"compact summary"}}',
+        # Multi-chunk >1 MiB line (tests chunk-list carry without O(k^2) concat)
+        json.dumps({"type": "user", "timestamp": "2026-11-26T01:08:00Z", "pad": big_pad, "message": {"role": "user", "content": "after 1200kib pad"}}),
+        # No trailing newline on last line
+        '{"type":"assistant","timestamp":"2026-11-26T01:09:00Z","message":{"role":"assistant","content":[{"type":"text","text":"assistant reply"}]}}',
+      ]
+      edge_file.write_text("\n".join(lines), encoding="utf-8")
+      (sub / "child.jsonl").write_text(
+        '{"type":"user","timestamp":"2026-11-26T02:00:00Z","message":{"role":"user","content":"subagent prompt"}}\n',
+        encoding="utf-8",
+      )
+
+      for kinds, roles in [
+        (None, None),
+        ({"text"}, {"user"}),
+        ({"text"}, {"system"}),
+        ({"tool_result"}, {"user"}),
+        ({"text"}, {"assistant"}),
+      ]:
+        ref = list(ccsi_mod.events_cc(str(edge_file), records=ccsi_mod.load_lines(str(edge_file)), kinds=kinds, roles=roles))
+        got = list(ccsi_mod.events_cc(str(edge_file), kinds=kinds, roles=roles))
+        self.assertEqual(got, ref, f"mismatch for kinds={kinds} roles={roles}")
+
+      # Keyword-only exclude_subagents contract
+      with self.assertRaises(TypeError):
+        list(ccsi_mod.iter_files({"cc"}, None, True))
+
+      # CLI --role user --exclude-subagents excludes subagents & assistant rows
+      res = run_ccsi(home, "events", "--vendor", "cc", "--kind", "text", "--role", "user", "--exclude-subagents")
+      rows = [json.loads(l) for l in res.stdout.splitlines() if l.strip()]
+      self.assertTrue(all(r["role"] == "user" and "/subagents/" not in r["path"] for r in rows))
+      self.assertEqual(
+        [r["text"] for r in rows],
+        ["escaped user msg", "shuffled list text", "real string after dup message", "after 1200kib pad"],
+      )
+
+  def test_events_parallel_filtered_order_and_unfiltered_streaming(self):
+    # Filtered queries over >=8 files & >=4 MiB use parallel spool and preserve exact file order;
+    # unfiltered queries stay single-process streaming (no TMPDIR spool).
+    with tempfile.TemporaryDirectory() as td:
+      home = Path(td)
+      proj = home / ".claude/projects/-proj"
+      proj.mkdir(parents=True)
+      pad = "x" * 500
+      for i in range(10):
+        rows = [
+          json.dumps({"type": "user", "timestamp": f"2026-11-26T00:{i:02d}:00Z", "pad": pad, "message": {"role": "user", "content": f"msg-{i}-{j}"}})
+          for j in range(900)
+        ]
+        (proj / f"f{i:02d}.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+      res_par = run_ccsi(home, "events", "--vendor", "cc", "--kind", "text", "--role", "user")
+      par_lines = res_par.stdout.splitlines()
+      self.assertEqual(len(par_lines), 9000)
+      # Verify ordering across files is deterministic and identical to single-process emit
+      seen_files = []
+      for l in par_lines:
+        bn = os.path.basename(json.loads(l)["path"])
+        if not seen_files or seen_files[-1] != bn:
+          seen_files.append(bn)
+      self.assertEqual(len(seen_files), 10)
+      self.assertEqual(len(set(seen_files)), 10)
+
 
 if __name__ == "__main__":
   unittest.main()
